@@ -11,11 +11,12 @@ Commands:
   score        Score all items in a raw extract file
   promote      Promote pending items (score ≥5) to entity pages
   synthesize   Detect entity clusters, flag synthesis candidates
-  lint         Validate entity pages (+ contradiction detection)
+  lint         Validate entity pages (+ contradiction detection + gap analysis)
   status       Print knowledge graph stats
   query        Find and display an entity page
   file         File a synthesis answer directly into the knowledge graph
   index        Generate LLM-readable knowledge index at docs/knowledge-index.md
+  wakeup       Assemble L0+L1 session bootstrap context (~900 tokens)
 """
 
 import argparse
@@ -1103,6 +1104,97 @@ def detect_contradictions(entity_dir: str | None = None) -> list[Contradiction]:
     return contradictions
 
 
+# ── Gap Analysis ─────────────────────────────────────────────────────────────
+
+def detect_gaps(entity_dir: str | None = None) -> list[dict]:
+    """
+    Find concepts mentioned in wikilinks but lacking entity pages.
+
+    Scans all entity pages in research/entities/, collects existing slugs
+    from filenames, then collects all wikilink targets from:
+      - related: field in frontmatter (list of [[slug]] entries)
+      - compounds_from: field in frontmatter
+      - [[wikilink]] references in the body
+
+    For each wikilink target that doesn't match an existing slug, counts
+    how many entity pages reference it. Returns targets referenced by >= 2
+    entity pages, sorted by count descending.
+    """
+    edir = Path(entity_dir) if entity_dir else ENTITIES_DIR
+    if not edir.exists():
+        return []
+
+    # 1. Collect all existing slugs from filenames
+    existing_slugs: set[str] = set()
+    entity_files: list[Path] = []
+    for entity_file in edir.rglob("*.md"):
+        existing_slugs.add(entity_file.stem)
+        entity_files.append(entity_file)
+
+    if not entity_files:
+        return []
+
+    # 2. For each entity page, collect all wikilink targets
+    #    Track: target_slug -> list of source slugs that reference it
+    references: dict[str, list[str]] = {}
+
+    for entity_file in entity_files:
+        source_slug = entity_file.stem
+        text = entity_file.read_text(errors="replace")
+        fm, body = parse_frontmatter(text)
+
+        targets: set[str] = set()
+
+        # From frontmatter: related field (list of [[slug]] entries)
+        if fm:
+            related = fm.get("related", [])
+            if isinstance(related, list):
+                for ref in related:
+                    ref_str = str(ref).strip()
+                    # Extract slug from [[slug]] format
+                    m = re.match(r"^\[\[([^\]]+)\]\]$", ref_str)
+                    if m:
+                        targets.add(slugify(m.group(1).split("|")[0]))
+
+            # From frontmatter: compounds_from field
+            compounds = fm.get("compounds_from", [])
+            if isinstance(compounds, list):
+                for ref in compounds:
+                    ref_str = str(ref).strip()
+                    m = re.match(r"^\[\[([^\]]+)\]\]$", ref_str)
+                    if m:
+                        targets.add(slugify(m.group(1).split("|")[0]))
+
+        # From body: [[wikilink]] references (skip HTML comments)
+        body_no_comments = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+        wikilinks = re.findall(r"\[\[([^\]]+)\]\]", body_no_comments)
+        for link in wikilinks:
+            slug = slugify(link.split("|")[0])
+            if slug:
+                targets.add(slug)
+
+        # Record references for targets that don't exist
+        for target in targets:
+            if target and target not in existing_slugs:
+                references.setdefault(target, []).append(source_slug)
+
+    # 3. Filter to targets referenced by >= 2 entity pages
+    gaps = []
+    for slug, referrers in references.items():
+        # Deduplicate referrers (same page might reference via frontmatter + body)
+        unique_referrers = sorted(set(referrers))
+        if len(unique_referrers) >= 2:
+            gaps.append({
+                "slug": slug,
+                "referenced_by": unique_referrers,
+                "count": len(unique_referrers),
+            })
+
+    # Sort by count descending
+    gaps.sort(key=lambda g: g["count"], reverse=True)
+    return gaps
+
+
 # ── Stage 7: Lint ─────────────────────────────────────────────────────────────
 
 def lint_entity_page(entity_path: Path) -> list[LintError]:
@@ -1190,11 +1282,11 @@ def lint_entity_page(entity_path: Path) -> list[LintError]:
     return errors
 
 
-def lint_all(verbose: bool = False) -> tuple[list[LintError], list[Contradiction]]:
-    """Run lint_entity_page on all entity pages, detect contradictions, and aggregate results."""
+def lint_all(verbose: bool = False) -> tuple[list[LintError], list[Contradiction], list[dict]]:
+    """Run lint_entity_page on all entity pages, detect contradictions and gaps, and aggregate results."""
     all_errors: list[LintError] = []
     if not ENTITIES_DIR.exists():
-        return all_errors, []
+        return all_errors, [], []
     pages = list(ENTITIES_DIR.rglob("*.md"))
     if verbose:
         print(f"[lint] Checking {len(pages)} entity pages...")
@@ -1214,7 +1306,14 @@ def lint_all(verbose: bool = False) -> tuple[list[LintError], list[Contradiction
             print(f"    A: {c.claim_a[:80]}...")
             print(f"    B: {c.claim_b[:80]}...")
 
-    return all_errors, contradictions
+    # Gap analysis
+    gaps = detect_gaps()
+    if verbose and gaps:
+        print(f"\n[lint] {len(gaps)} knowledge gaps detected (concepts referenced but missing entity pages):")
+        for g in gaps:
+            print(f"  [[{g['slug']}]] referenced by {g['count']} entities: {', '.join(g['referenced_by'][:5])}")
+
+    return all_errors, contradictions, gaps
 
 
 # ── Full Pipeline ─────────────────────────────────────────────────────────────
@@ -1322,7 +1421,7 @@ def run_pipeline(
             print(f"  topic={c['topic']!r} entities={c['entity_count']}")
 
     # ── Stage 7: Lint ──
-    lint_errors, contradictions = lint_all(verbose=verbose)
+    lint_errors, contradictions, gaps = lint_all(verbose=verbose)
     lint_error_count = len([e for e in lint_errors if e.severity == "error"])
 
     duration = round(time.time() - start_time, 2)
@@ -1341,6 +1440,7 @@ def run_pipeline(
         "synthesis_candidates": len(synthesis_candidates),
         "lint_errors": lint_error_count,
         "contradictions": len(contradictions),
+        "knowledge_gaps": len(gaps),
         "scoring_breakdown": scoring_breakdown,
         "duration_seconds": duration,
     }
@@ -1354,7 +1454,7 @@ def run_pipeline(
     print(f"  Ingested: {items_ingested} | Scored: {items_scored} | Promoted: {items_promoted}")
     print(f"  Discarded: {items_discarded} | Raw-only: {items_raw_only}")
     print(f"  Entities created: {entities_created} | Updated: {entities_updated}")
-    print(f"  Synthesis candidates: {len(synthesis_candidates)} | Lint errors: {lint_error_count} | Contradictions: {len(contradictions)}")
+    print(f"  Synthesis candidates: {len(synthesis_candidates)} | Lint errors: {lint_error_count} | Contradictions: {len(contradictions)} | Gaps: {len(gaps)}")
     if dry_run:
         print("  [DRY RUN] No files written.")
 
@@ -1822,15 +1922,16 @@ def cmd_synthesize(args: argparse.Namespace) -> None:
 
 
 def cmd_lint(args: argparse.Namespace) -> None:
-    """Validate entity pages for frontmatter correctness, broken wikilinks, and contradictions."""
+    """Validate entity pages for frontmatter correctness, broken wikilinks, contradictions, and gaps."""
     contradictions: list[Contradiction] = []
+    gaps: list[dict] = []
     if args.all or not args.file:
-        errors, contradictions = lint_all(verbose=args.verbose)
+        errors, contradictions, gaps = lint_all(verbose=args.verbose)
     else:
         path = Path(args.file)
         errors = lint_entity_page(path)
 
-    if not errors and not contradictions:
+    if not errors and not contradictions and not gaps:
         print("[lint] No errors found.")
         return
 
@@ -1849,8 +1950,16 @@ def cmd_lint(args: argparse.Namespace) -> None:
             print(f"    A: {c.claim_a[:100]}")
             print(f"    B: {c.claim_b[:100]}")
 
+    if gaps:
+        print(f"\n[lint] {len(gaps)} knowledge gaps (referenced concepts without entity pages):")
+        for g in gaps:
+            refs = ", ".join(g["referenced_by"][:5])
+            suffix = f" (+{g['count'] - 5} more)" if g["count"] > 5 else ""
+            print(f"  [[{g['slug']}]] — {g['count']} references: {refs}{suffix}")
+        print("  Suggestion: create entity pages for frequently-referenced missing concepts.")
+
     total_issues = len(errors) + len(contradictions)
-    print(f"\n[lint] {total_issues} issues: {error_count} errors, {warning_count} warnings, {len(contradictions)} contradictions")
+    print(f"\n[lint] {total_issues} issues: {error_count} errors, {warning_count} warnings, {len(contradictions)} contradictions, {len(gaps)} gaps")
     if error_count > 0:
         sys.exit(1)
 
@@ -1890,6 +1999,99 @@ def cmd_index(args: argparse.Namespace) -> None:
     )
     if args.stdout:
         print(content)
+
+
+def cmd_wakeup(args: argparse.Namespace) -> None:
+    """Assemble L0 + L1 context for session bootstrap (~900 tokens)."""
+    project_root = BROOMVA_ROOT
+    token_budget = getattr(args, "tokens", 900)
+
+    output_parts: list[str] = []
+
+    # L0: Core invariants (~100 tokens)
+    # Read CLAUDE.md, extract just the workspace name and key conventions
+    claude_md = project_root / "CLAUDE.md"
+    if claude_md.exists():
+        text = claude_md.read_text(errors="replace")
+        lines = text.split("\n")
+        l0_lines: list[str] = []
+        tokens = 0
+        for line in lines:
+            est = len(line) // 4
+            if tokens + est > 100:
+                break
+            l0_lines.append(line)
+            tokens += est
+        output_parts.append("## L0: Identity\n" + "\n".join(l0_lines))
+
+    # L1: Top-k entities by score (~500-800 tokens)
+    entity_dir = project_root / "research" / "entities"
+    if entity_dir.exists():
+        entities: list[dict] = []
+        for md_file in entity_dir.rglob("*.md"):
+            try:
+                text = md_file.read_text(errors="replace")
+                fm, body = parse_frontmatter(text)
+                score = 0
+
+                # Try frontmatter scoring block
+                if fm and isinstance(fm.get("scoring"), dict):
+                    raw_score = fm["scoring"].get("raw_score")
+                    if raw_score is not None:
+                        score = int(raw_score)
+
+                # Fallback: parse score from body (Evidence section)
+                if score == 0:
+                    score_match = re.search(r"Score:\s*(\d+)/9", text)
+                    if score_match:
+                        score = int(score_match.group(1))
+
+                title = fm.get("title", md_file.stem) if fm else md_file.stem
+                core_claim = str(fm.get("core_claim", "")).strip() if fm else ""
+                entity_type = str(fm.get("type", "unknown")).strip() if fm else "unknown"
+                entities.append({
+                    "slug": md_file.stem,
+                    "type": entity_type,
+                    "title": title,
+                    "core_claim": core_claim,
+                    "score": score,
+                })
+            except Exception:
+                continue
+
+        # Sort by score descending, take top-k within budget
+        entities.sort(key=lambda e: e["score"], reverse=True)
+        l1_lines: list[str] = ["## L1: Top Entities"]
+        tokens = 0
+        remaining_budget = token_budget - 100  # L0 budget
+        for e in entities:
+            claim = e["core_claim"] or e["title"]
+            line = f"- {e['slug']} ({e['type']}) | {claim} | score: {e['score']}"
+            est = len(line) // 4
+            if tokens + est > remaining_budget:
+                break
+            l1_lines.append(line)
+            tokens += est
+        output_parts.append("\n".join(l1_lines))
+
+    # Navigation pointer
+    index_path = project_root / "docs" / "knowledge-index.md"
+    if index_path.exists():
+        est_tokens = index_path.stat().st_size // 4
+        output_parts.append(
+            f"\n## Navigation\nFull index: docs/knowledge-index.md ({est_tokens} est. tokens)"
+        )
+
+    result = "\n\n".join(output_parts)
+    print(result)
+
+    # Optionally write to a file
+    output_file = getattr(args, "output", None)
+    if output_file:
+        out_path = Path(output_file)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(result)
+        print(f"\nWritten to {output_file}")
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
@@ -1967,6 +2169,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--no-conversations", action="store_true", help="Exclude recent sessions section")
     p_index.add_argument("--stdout", action="store_true", help="Also print to stdout")
     p_index.set_defaults(func=cmd_index)
+
+    # wakeup
+    p_wakeup = sub.add_parser("wakeup", help="Assemble L0+L1 session bootstrap context")
+    p_wakeup.add_argument("--tokens", type=int, default=900, help="Token budget (default 900)")
+    p_wakeup.add_argument("--output", type=str, metavar="FILE", help="Write output to file")
+    p_wakeup.set_defaults(func=cmd_wakeup)
 
     return parser
 
