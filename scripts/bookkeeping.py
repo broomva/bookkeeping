@@ -281,66 +281,205 @@ def _ingest_jsonl(text: str, source_id: str, source_type: str) -> list[RawItem]:
             continue
         try:
             obj = json.loads(line)
-            content = obj.get("content") or obj.get("text") or obj.get("body") or str(obj)
-            if len(content) < 20:
-                continue
-            items.append(_make_item(
-                source_id=source_id,
-                source_type=source_type,
-                content=content,
-                quote=obj.get("quote", ""),
-                author=obj.get("author", ""),
-                timestamp=obj.get("timestamp", ""),
-                metadata={k: v for k, v in obj.items() if k not in ("content", "quote", "author", "timestamp")},
-            ))
         except json.JSONDecodeError:
-            pass
+            continue
+
+        # ── Loop-log format ────────────────────────────────────────────────────
+        # Each line is a 30-min engagement run with moltbook_comments[], x_posts[],
+        # and a notes string. Extract each comment topic and x post as a separate item.
+        if "moltbook_comments" in obj or "x_posts" in obj:
+            run_id = obj.get("run_id", "")
+            ts = obj.get("timestamp", "")
+            karma = obj.get("karma", "")
+
+            for cmt in (obj.get("moltbook_comments") or []) if isinstance(obj.get("moltbook_comments"), list) else []:
+                topic = cmt.get("topic") or cmt.get("angle") or ""
+                if not topic or len(topic) < 20:
+                    continue
+                post_id = cmt.get("post_id", "")
+                angle = cmt.get("angle", "")
+                content = f"{topic}\n\nAngle: {angle}" if angle and angle != topic else topic
+                items.append(_make_item(
+                    source_id=source_id,
+                    source_type="moltbook",
+                    content=content,
+                    quote=topic[:200],
+                    author="broomva",
+                    timestamp=ts,
+                    metadata={"run_id": run_id, "post_id": post_id, "karma": karma},
+                ))
+
+            for xp in (obj.get("x_posts") or []) if isinstance(obj.get("x_posts"), list) else []:
+                note = xp.get("note", "")
+                if not note or len(note) < 20:
+                    continue
+                items.append(_make_item(
+                    source_id=source_id,
+                    source_type="x",
+                    content=note,
+                    quote=note[:200],
+                    author="broomva_tech",
+                    timestamp=ts,
+                    metadata={"run_id": run_id, "tweet_id": xp.get("id", ""), "type": xp.get("type", ""), "karma": karma},
+                ))
+
+            # The run-level notes field as a summary item
+            notes = obj.get("notes", "")
+            if notes and len(notes) > 30:
+                items.append(_make_item(
+                    source_id=source_id,
+                    source_type="moltbook",
+                    content=notes,
+                    quote=notes[:200],
+                    author="broomva",
+                    timestamp=ts,
+                    metadata={"run_id": run_id, "karma": karma, "item_type": "run-summary"},
+                ))
+            continue
+
+        # ── Generic JSONL format ───────────────────────────────────────────────
+        content = obj.get("content") or obj.get("text") or obj.get("body") or ""
+        if not content or len(content) < 20:
+            continue
+        items.append(_make_item(
+            source_id=source_id,
+            source_type=source_type,
+            content=content,
+            quote=obj.get("quote", ""),
+            author=obj.get("author", ""),
+            timestamp=obj.get("timestamp", ""),
+            metadata={k: v for k, v in obj.items() if k not in ("content", "quote", "author", "timestamp")},
+        ))
     return items
 
 
 def _ingest_markdown(text: str, source_id: str, source_type: str) -> list[RawItem]:
+    """
+    Parse markdown files into RawItems.
+
+    Supports two formats:
+    1. social-insights-raw.md format — ## Item N sections with blockquote content,
+       **Score** lines, and **Our angle** / **→ Suggested destination** metadata.
+    2. synthesis / general notes format — ## section headers as item boundaries,
+       with paragraph content below each header.
+    3. Fallback — split by paragraph (≥40 chars).
+    """
     fm, body = parse_frontmatter(text)
     items = []
 
-    # Try to parse ## Item blocks
-    item_blocks = re.split(r"\n## Item \d+", body)
+    # ── Format 1: ## Item N blocks (social-insights-raw.md) ─────────────────
+    # Pattern: ## Item 3 — @author (Platform `post_id`)
+    item_pattern = re.compile(r"^## Item \d+", re.MULTILINE)
+    item_blocks = item_pattern.split(body)
+
     if len(item_blocks) > 1:
         for block in item_blocks[1:]:
-            lines = block.strip().splitlines()
-            content_lines = []
-            quote = ""
-            author = ""
+            lines = block.splitlines()
+
+            # Extract header line (first non-empty after split)
+            header = lines[0].strip() if lines else ""
+            # Parse author from "— @author (Platform ...)"
+            author_match = re.search(r"@(\w[\w\d_]+)", header)
+            author = f"@{author_match.group(1)}" if author_match else ""
+            post_id_match = re.search(r"`([a-f0-9\-]{6,})`", header)
+            post_id = post_id_match.group(1) if post_id_match else ""
+
+            # Extract score from "**Score**: 6/9 — novelty:3 specificity:2 relevance:1"
+            score_total = 0
+            novelty = specificity = relevance = 0
+            for line in lines:
+                sm = re.search(r"\*\*Score\*\*[:\s]+(\d+)/9.*?novelty[:\s]*(\d).*?specificity[:\s]*(\d).*?relevance[:\s]*(\d)", line)
+                if sm:
+                    score_total = int(sm.group(1))
+                    novelty, specificity, relevance = int(sm.group(2)), int(sm.group(3)), int(sm.group(4))
+                    break
+
+            # Collect blockquote lines as the quote (the external voice)
+            quote_lines = []
+            in_quote = False
             for line in lines:
                 if line.startswith("> "):
-                    quote = line[2:].strip()
-                elif line.startswith("**Score**") or line.startswith("**→"):
+                    quote_lines.append(line[2:].strip())
+                    in_quote = True
+                elif in_quote and line.strip() == ">":
+                    quote_lines.append("")  # blank blockquote line
+                elif in_quote and not line.startswith(">"):
+                    in_quote = False
+
+            quote = "\n".join(quote_lines).strip()
+
+            # Collect "Our angle" content — lines after **Our angle** header
+            # (this is the broomva comment text, which is the main content)
+            angle_lines = []
+            in_angle = False
+            for line in lines:
+                if re.match(r"\*\*Our angle\*\*", line):
+                    in_angle = True
+                    # Remainder of this line after the header
+                    rest = re.sub(r"\*\*Our angle\*\*[:\s]*", "", line).strip()
+                    if rest:
+                        angle_lines.append(rest)
                     continue
-                elif line.startswith("**Our angle**"):
-                    continue
-                elif re.match(r"@\w+", line):
-                    author = line.strip()
-                else:
-                    content_lines.append(line)
-            content = " ".join(l for l in content_lines if l.strip())
-            if quote and not content:
-                content = quote
-            if len(content) < 20:
+                if in_angle:
+                    if line.startswith("**→") or line.startswith("---"):
+                        break
+                    if line.startswith("> "):
+                        angle_lines.append(line[2:].strip())
+                    elif line.strip():
+                        angle_lines.append(line.strip())
+
+            angle_text = "\n".join(angle_lines).strip()
+
+            # Main content = our angle (what we said) if present; else the quote
+            content = angle_text if len(angle_text) >= 40 else quote
+            if not content or len(content) < 20:
                 continue
+
             items.append(_make_item(
                 source_id=source_id,
                 source_type=source_type,
                 content=content,
                 quote=quote,
                 author=author,
-                metadata=dict(fm),
+                metadata={
+                    **dict(fm),
+                    "post_id": post_id,
+                    "score_total": score_total,
+                    "novelty": novelty,
+                    "specificity": specificity,
+                    "relevance": relevance,
+                    "pre_scored": True,  # already scored by extraction loop
+                },
             ))
         return items
 
-    # Fall back: split by paragraphs
+    # ── Format 2: ## Section headers as item boundaries (synthesis notes) ───
+    section_pattern = re.compile(r"^#{1,3} .+", re.MULTILINE)
+    sections = section_pattern.split(body)
+    headers = section_pattern.findall(body)
+
+    if len(sections) > 2:  # more than just a preamble
+        for header, section_body in zip(headers, sections[1:]):
+            section_body = section_body.strip()
+            if not section_body or len(section_body) < 60:
+                continue
+            # Skip table-of-contents-only sections
+            if section_body.count("\n") < 2 and not re.search(r"[.!?]", section_body):
+                continue
+            content = f"{header.lstrip('#').strip()}\n\n{section_body}"
+            items.append(_make_item(
+                source_id=source_id,
+                source_type=source_type,
+                content=content.strip(),
+                metadata=dict(fm),
+            ))
+        if items:
+            return items
+
+    # ── Format 3: Paragraph fallback ────────────────────────────────────────
     paragraphs = re.split(r"\n{2,}", body)
     for para in paragraphs:
         para = para.strip()
-        # Skip frontmatter-like lines and headers
         if not para or para.startswith("#") or para.startswith("---"):
             continue
         if len(para) < 40:
@@ -638,10 +777,15 @@ def resolve_candidates(
 # ── Stage 5: Promote ──────────────────────────────────────────────────────────
 
 def _load_entity_template() -> str:
-    """Load the entity page template, or return a built-in default."""
-    if ENTITY_TEMPLATE.exists():
-        return ENTITY_TEMPLATE.read_text()
-    # Built-in default template
+    """
+    Return the built-in entity template used by promote_item().
+
+    The external entity-page.md template (ENTITY_TEMPLATE) is the *human-authoring*
+    template — its placeholders use descriptive names like {Human-Readable Title} that
+    are not intended for programmatic substitution. The built-in default below uses the
+    exact keys that content_map in promote_item() populates.
+    """
+    # Built-in default template — keys match content_map exactly
     return """\
 ---
 slug: {slug}
@@ -676,7 +820,7 @@ Source: {source_ref} | Score: {score}/9 (n={novelty} s={specificity} r={relevanc
 
 ## Related
 
-<!-- Add [[wikilinks]] to related entities -->
+<!-- Add wikilinks to related entities here, e.g. [[arcan]] [[memory]] -->
 
 ## Open Questions
 
@@ -735,7 +879,10 @@ def promote_item(
 
     template = _load_entity_template()
     title = entity_slug.replace("-", " ").title()
-    core_claim = (scored.item.content[:137] + "...") if len(scored.item.content) > 140 else scored.item.content
+    # core_claim must be a single YAML-safe line — strip newlines and escape double quotes
+    raw_claim = scored.item.content.replace("\n", " ").replace("\r", " ").replace('"', "'")
+    raw_claim = re.sub(r"\s+", " ", raw_claim).strip()
+    core_claim = (raw_claim[:137] + "...") if len(raw_claim) > 140 else raw_claim
     source_ref = scored.item.source_id
     today = today_str()
 
@@ -897,8 +1044,9 @@ def lint_entity_page(entity_path: Path) -> list[LintError]:
                     f"related entry {ref!r} is not [[wikilink]] format", "error"
                 ))
 
-    # Resolve wikilinks in body
-    wikilinks = re.findall(r"\[\[([^\]]+)\]\]", body)
+    # Resolve wikilinks in body — skip HTML comment lines to avoid false positives
+    body_no_comments = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    wikilinks = re.findall(r"\[\[([^\]]+)\]\]", body_no_comments)
     existing = set(existing_entity_slugs())
     for link in wikilinks:
         slug = slugify(link.split("|")[0])
