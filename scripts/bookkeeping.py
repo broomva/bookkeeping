@@ -521,6 +521,73 @@ def _ingest_plaintext(text: str, source_id: str, source_type: str) -> list[RawIt
     return items
 
 
+def ingest_egri_traces(trace_file: str, verbose: bool = False) -> list:
+    """Ingest EGRI trial traces as raw items for scoring."""
+    items = []
+    try:
+        with open(trace_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    # Look for egri.* event types
+                    event_type = data.get('event_type', '')
+                    if not event_type.startswith('egri.'):
+                        continue
+
+                    trial = data.get('trial', {})
+                    mutation = trial.get('mutation', {})
+                    outcome = trial.get('outcome', {})
+                    decision = trial.get('decision', {})
+
+                    # Build content from trial data
+                    content_parts = []
+                    if mutation.get('description'):
+                        content_parts.append(f"Mutation: {mutation['description']}")
+                    if mutation.get('hypothesis'):
+                        content_parts.append(f"Hypothesis: {mutation['hypothesis']}")
+                    if outcome.get('score') is not None:
+                        content_parts.append(f"Score: {outcome['score']}")
+                    if decision.get('action'):
+                        content_parts.append(f"Decision: {decision['action']}")
+                    if decision.get('reason'):
+                        content_parts.append(f"Reason: {decision['reason']}")
+
+                    content = '\n'.join(content_parts)
+                    if not content:
+                        continue
+
+                    # Determine entity type based on decision
+                    action = decision.get('action', '')
+                    entity_type = 'pattern' if action == 'promoted' else 'discovery'
+
+                    item = RawItem(
+                        item_id=f"egri-{trial.get('trial_id', 'unknown')}",
+                        source_id=trace_file,
+                        source_type='egri-trace',
+                        content=content,
+                        quote=mutation.get('description', ''),
+                        author='egri',
+                        timestamp=trial.get('timestamp', ''),
+                        metadata={
+                            'trial_id': trial.get('trial_id', ''),
+                            'action': action,
+                            'score': str(outcome.get('score', '')),
+                            'entity_type': entity_type,
+                        }
+                    )
+                    items.append(item)
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        if verbose:
+            print(f"  trace file not found: {trace_file}")
+
+    return items
+
+
 def discover_raw_extracts() -> list[Path]:
     """Find all raw extract files in NOTES_DIR matching the naming convention."""
     if not NOTES_DIR.exists():
@@ -1837,7 +1904,11 @@ def cmd_run(args: argparse.Namespace) -> None:
 def cmd_ingest(args: argparse.Namespace) -> None:
     """Normalize a single file and print JSON to stdout."""
     path = Path(args.source)
-    items = ingest_file(path, verbose=args.verbose)
+    source_type = getattr(args, 'source_type', None)
+    if source_type == 'egri-trace':
+        items = ingest_egri_traces(str(path), verbose=args.verbose)
+    else:
+        items = ingest_file(path, verbose=args.verbose)
     print(json.dumps([asdict(i) for i in items], indent=2))
 
 
@@ -2116,6 +2187,8 @@ def build_parser() -> argparse.ArgumentParser:
     # ingest
     p_ingest = sub.add_parser("ingest", help="Normalize a file to JSON")
     p_ingest.add_argument("--source", required=True, metavar="FILE", help="Source file to ingest")
+    p_ingest.add_argument("--source-type", dest="source_type", metavar="TYPE",
+                          help="Source type override (e.g. egri-trace)")
     p_ingest.add_argument("--verbose", "-v", action="store_true")
     p_ingest.set_defaults(func=cmd_ingest)
 
