@@ -11,9 +11,11 @@ Commands:
   score        Score all items in a raw extract file
   promote      Promote pending items (score ≥5) to entity pages
   synthesize   Detect entity clusters, flag synthesis candidates
-  lint         Validate entity pages
+  lint         Validate entity pages (+ contradiction detection)
   status       Print knowledge graph stats
   query        Find and display an entity page
+  file         File a synthesis answer directly into the knowledge graph
+  index        Generate LLM-readable knowledge index at docs/knowledge-index.md
 """
 
 import argparse
@@ -114,6 +116,16 @@ class LintError:
     field: str
     message: str
     severity: str = "error"  # error | warning
+
+
+@dataclass
+class Contradiction:
+    """A detected contradiction between two entity page claims."""
+    note_a: str
+    note_b: str
+    claim_a: str
+    claim_b: str
+    confidence: float
 
 
 @dataclass
@@ -972,6 +984,125 @@ def find_synthesis_candidates(verbose: bool = False) -> list[dict]:
     return filtered[:20]
 
 
+# ── Contradiction Detection ──────────────────────────────────────────────────
+
+NEGATION_WORDS = {"not", "never", "instead", "rather", "without", "no", "none", "nor", "neither", "cannot", "can't", "won't", "don't", "doesn't", "isn't", "aren't", "wasn't", "weren't"}
+NEGATION_PHRASES = {"instead of", "rather than", "as opposed to", "in contrast to"}
+
+
+def _tokenize_claim(text: str) -> set[str]:
+    """Tokenize a claim into lowercase word set, filtering stop words."""
+    words = re.findall(r"\b[a-z][a-z0-9_-]{2,}\b", text.lower())
+    return {w for w in words if w not in TECH_STOP_WORDS}
+
+
+def _jaccard_similarity(set_a: set[str], set_b: set[str]) -> float:
+    """Compute Jaccard similarity between two sets."""
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def _negation_strength(claim_a: str, claim_b: str) -> float:
+    """
+    Compute negation asymmetry between two claims.
+
+    Returns a value in [0, 1] representing how strongly one claim
+    negates the other. Higher values mean one claim contains negation
+    words/phrases that the other doesn't.
+    """
+    text_a = claim_a.lower()
+    text_b = claim_b.lower()
+
+    # Count negation word hits in each claim
+    neg_a = sum(1 for w in NEGATION_WORDS if re.search(r"\b" + re.escape(w) + r"\b", text_a))
+    neg_b = sum(1 for w in NEGATION_WORDS if re.search(r"\b" + re.escape(w) + r"\b", text_b))
+
+    # Count negation phrase hits
+    for phrase in NEGATION_PHRASES:
+        if phrase in text_a:
+            neg_a += 2
+        if phrase in text_b:
+            neg_b += 2
+
+    # Asymmetry: one has negation, the other doesn't
+    if neg_a == 0 and neg_b == 0:
+        return 0.0
+    if neg_a > 0 and neg_b > 0:
+        # Both have negation — less likely a contradiction
+        return 0.1
+    # One has negation, other doesn't — strong signal
+    diff = abs(neg_a - neg_b)
+    return min(1.0, diff * 0.3)
+
+
+def detect_contradictions(entity_dir: str | None = None) -> list[Contradiction]:
+    """
+    Compare core_claim fields across entity pages for contradictions.
+
+    Scans all entity pages, extracts core_claim from frontmatter,
+    and detects pairs where one claim negates the other despite
+    high topical similarity (Jaccard > 0.3).
+
+    Returns contradictions with confidence > 0.2.
+    """
+    edir = Path(entity_dir) if entity_dir else ENTITIES_DIR
+    if not edir.exists():
+        return []
+
+    # 1. Read all entity pages, extract core_claim from frontmatter
+    claims: list[tuple[str, str]] = []  # (file_stem, core_claim)
+    for entity_file in edir.rglob("*.md"):
+        text = entity_file.read_text(errors="replace")
+        fm, _ = parse_frontmatter(text)
+        if not fm:
+            continue
+        core_claim = str(fm.get("core_claim", "")).strip()
+        if core_claim and len(core_claim) >= 10:
+            claims.append((entity_file.stem, core_claim))
+
+    if len(claims) < 2:
+        return []
+
+    # 2. Tokenize each claim
+    tokenized: list[tuple[str, str, set[str]]] = []
+    for stem, claim in claims:
+        tokens = _tokenize_claim(claim)
+        if tokens:
+            tokenized.append((stem, claim, tokens))
+
+    # 3. For each pair with Jaccard similarity > 0.3, check negation asymmetry
+    contradictions: list[Contradiction] = []
+    for i in range(len(tokenized)):
+        for j in range(i + 1, len(tokenized)):
+            stem_a, claim_a, tokens_a = tokenized[i]
+            stem_b, claim_b, tokens_b = tokenized[j]
+
+            jaccard = _jaccard_similarity(tokens_a, tokens_b)
+            if jaccard < 0.3:
+                continue
+
+            neg_strength = _negation_strength(claim_a, claim_b)
+            if neg_strength <= 0.0:
+                continue
+
+            confidence = jaccard * neg_strength
+            if confidence > 0.2:
+                contradictions.append(Contradiction(
+                    note_a=stem_a,
+                    note_b=stem_b,
+                    claim_a=claim_a,
+                    claim_b=claim_b,
+                    confidence=round(confidence, 3),
+                ))
+
+    # Sort by confidence descending
+    contradictions.sort(key=lambda c: c.confidence, reverse=True)
+    return contradictions
+
+
 # ── Stage 7: Lint ─────────────────────────────────────────────────────────────
 
 def lint_entity_page(entity_path: Path) -> list[LintError]:
@@ -1059,11 +1190,11 @@ def lint_entity_page(entity_path: Path) -> list[LintError]:
     return errors
 
 
-def lint_all(verbose: bool = False) -> list[LintError]:
-    """Run lint_entity_page on all entity pages and aggregate errors."""
+def lint_all(verbose: bool = False) -> tuple[list[LintError], list[Contradiction]]:
+    """Run lint_entity_page on all entity pages, detect contradictions, and aggregate results."""
     all_errors: list[LintError] = []
     if not ENTITIES_DIR.exists():
-        return all_errors
+        return all_errors, []
     pages = list(ENTITIES_DIR.rglob("*.md"))
     if verbose:
         print(f"[lint] Checking {len(pages)} entity pages...")
@@ -1073,7 +1204,17 @@ def lint_all(verbose: bool = False) -> list[LintError]:
         if verbose and errs:
             for e in errs:
                 print(f"  [{e.severity.upper()}] {Path(e.file_path).name}: {e.field} — {e.message}")
-    return all_errors
+
+    # Contradiction detection
+    contradictions = detect_contradictions()
+    if verbose and contradictions:
+        print(f"\n[lint] {len(contradictions)} potential contradictions detected:")
+        for c in contradictions:
+            print(f"  [{c.confidence:.2f}] {c.note_a} vs {c.note_b}")
+            print(f"    A: {c.claim_a[:80]}...")
+            print(f"    B: {c.claim_b[:80]}...")
+
+    return all_errors, contradictions
 
 
 # ── Full Pipeline ─────────────────────────────────────────────────────────────
@@ -1181,7 +1322,7 @@ def run_pipeline(
             print(f"  topic={c['topic']!r} entities={c['entity_count']}")
 
     # ── Stage 7: Lint ──
-    lint_errors = lint_all(verbose=verbose)
+    lint_errors, contradictions = lint_all(verbose=verbose)
     lint_error_count = len([e for e in lint_errors if e.severity == "error"])
 
     duration = round(time.time() - start_time, 2)
@@ -1199,6 +1340,7 @@ def run_pipeline(
         "entities_updated": entities_updated,
         "synthesis_candidates": len(synthesis_candidates),
         "lint_errors": lint_error_count,
+        "contradictions": len(contradictions),
         "scoring_breakdown": scoring_breakdown,
         "duration_seconds": duration,
     }
@@ -1212,7 +1354,7 @@ def run_pipeline(
     print(f"  Ingested: {items_ingested} | Scored: {items_scored} | Promoted: {items_promoted}")
     print(f"  Discarded: {items_discarded} | Raw-only: {items_raw_only}")
     print(f"  Entities created: {entities_created} | Updated: {entities_updated}")
-    print(f"  Synthesis candidates: {len(synthesis_candidates)} | Lint errors: {lint_error_count}")
+    print(f"  Synthesis candidates: {len(synthesis_candidates)} | Lint errors: {lint_error_count} | Contradictions: {len(contradictions)}")
     if dry_run:
         print("  [DRY RUN] No files written.")
 
@@ -1368,6 +1510,212 @@ def run_query(slug: str, verbose: bool = False) -> None:
     print(path.read_text())
 
 
+# ── File (Query-Filing Loop) ─────────────────────────────────────────────────
+
+def file_knowledge(
+    content: str,
+    slug: str,
+    entity_type: str = "concept",
+    dry_run: bool = False,
+    verbose: bool = False,
+) -> Path | None:
+    """
+    File a valuable synthesis answer directly into the knowledge graph.
+
+    Creates a temporary RawItem from the content, scores it through the
+    Nous gate, and if it passes the threshold, creates an entity page.
+    Returns the entity path if created, None otherwise.
+    """
+    ensure_dirs()
+
+    # Validate entity type
+    if entity_type not in ENTITY_TYPES:
+        print(f"[file] ERROR: type {entity_type!r} not in {ENTITY_TYPES}", file=sys.stderr)
+        return None
+
+    # Create a synthetic RawItem from the content
+    item = _make_item(
+        source_id="manual-filing",
+        source_type="research",
+        content=content,
+        quote=content[:200],
+        author="broomva",
+    )
+
+    # Score through Nous gate (heuristic only — no LLM for manual filings)
+    scored = score_item_heuristic(item)
+
+    if verbose:
+        print(
+            f"[file] Score: {scored.total}/9 "
+            f"(n={scored.novelty} s={scored.specificity} r={scored.relevance})"
+        )
+
+    if scored.total < PROMOTE_THRESHOLD:
+        print(
+            f"[file] Score {scored.total}/9 below threshold {PROMOTE_THRESHOLD}. "
+            f"Item not promoted."
+        )
+        if verbose:
+            print(f"  Content preview: {content[:100]!r}")
+            print(f"  Tip: Add more specific details, numbers, or code to increase score.")
+        return None
+
+    # Promote to entity page
+    path = promote_item(
+        scored, slug, entity_type=entity_type,
+        dry_run=dry_run, verbose=verbose,
+    )
+
+    if path and not dry_run:
+        # Log the filing operation
+        log_run({
+            "operation": "file",
+            "timestamp": now_iso(),
+            "slug": slug,
+            "entity_type": entity_type,
+            "score": scored.total,
+            "path": str(path),
+        })
+        print(f"[file] Filed: {path.relative_to(BROOMVA_ROOT)}")
+    elif dry_run:
+        print(f"[file] DRY RUN: would file {slug} as {entity_type}")
+
+    return path
+
+
+# ── Index Generation ─────────────────────────────────────────────────────────
+
+def generate_knowledge_index(
+    output_path: Path | None = None,
+    include_conversations: bool = True,
+    verbose: bool = False,
+) -> str:
+    """
+    Generate an LLM-readable knowledge index at docs/knowledge-index.md.
+
+    Scans research/entities/ for all entity pages, parses frontmatter,
+    groups by entity type, and formats as a flat catalog. Optionally
+    includes a Recent Sessions section from docs/conversations/.
+
+    Returns the generated index content as a string.
+    """
+    if output_path is None:
+        output_path = BROOMVA_ROOT / "docs" / "knowledge-index.md"
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"generated: {now_iso()}")
+    lines.append("generator: bookkeeping index")
+    lines.append("---")
+    lines.append("")
+    lines.append("# Knowledge Index")
+    lines.append("")
+    lines.append("LLM-readable catalog of all entity pages in the knowledge graph.")
+    lines.append("")
+
+    # Scan entities
+    entities_by_type: dict[str, list[dict]] = {}
+    total_count = 0
+
+    if ENTITIES_DIR.exists():
+        for et in ENTITY_TYPES:
+            type_dir = ENTITIES_DIR / et
+            if not type_dir.exists():
+                continue
+            for entity_file in sorted(type_dir.glob("*.md")):
+                text = entity_file.read_text(errors="replace")
+                fm, _ = parse_frontmatter(text)
+
+                entry = {
+                    "slug": entity_file.stem,
+                    "path": str(entity_file.relative_to(BROOMVA_ROOT)),
+                    "core_claim": str(fm.get("core_claim", "")).strip() if fm else "",
+                    "tags": fm.get("tags", []) if fm else [],
+                    "status": fm.get("status", "unknown") if fm else "unknown",
+                    "score": "",
+                }
+
+                # Try to extract score from the body (Evidence section)
+                score_match = re.search(r"Score:\s*(\d+)/9", text)
+                if score_match:
+                    entry["score"] = score_match.group(1)
+
+                # Also check frontmatter scoring block
+                if fm and isinstance(fm.get("scoring"), dict):
+                    raw_score = fm["scoring"].get("raw_score")
+                    if raw_score is not None:
+                        entry["score"] = str(raw_score)
+
+                entities_by_type.setdefault(et, []).append(entry)
+                total_count += 1
+
+    lines.append(f"**Total entities: {total_count}**")
+    lines.append("")
+
+    # Format entity catalog
+    lines.append("## Entities (by type)")
+    lines.append("")
+
+    for et in ENTITY_TYPES:
+        entries = entities_by_type.get(et, [])
+        if not entries:
+            continue
+        lines.append(f"### {et} ({len(entries)})")
+        lines.append("")
+        for e in entries:
+            tags_str = ", ".join(str(t) for t in e["tags"]) if e["tags"] else ""
+            score_str = f" | score: {e['score']}" if e["score"] else ""
+            claim_preview = e["core_claim"][:80] if e["core_claim"] else "(no claim)"
+            tag_part = f" | tags: {tags_str}" if tags_str else ""
+            lines.append(f"- **{e['slug']}** | {claim_preview}{tag_part}{score_str}")
+        lines.append("")
+
+    # Recent sessions section
+    if include_conversations:
+        conversations_dir = BROOMVA_ROOT / "core" / "life" / "docs" / "conversations"
+        if not conversations_dir.exists():
+            conversations_dir = BROOMVA_ROOT / "docs" / "conversations"
+
+        if conversations_dir.exists():
+            session_files = sorted(
+                conversations_dir.glob("session-*.md"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            recent = session_files[:10]
+            if recent:
+                lines.append("## Recent Sessions (last 10)")
+                lines.append("")
+                for sf in recent:
+                    text = sf.read_text(errors="replace")
+                    fm, _ = parse_frontmatter(text)
+                    title = fm.get("title", sf.stem) if fm else sf.stem
+                    date = fm.get("date", "") if fm else ""
+                    branch = fm.get("branch", "") if fm else ""
+                    parts = [f"**{sf.stem}**"]
+                    if date:
+                        parts.append(f"date: {date}")
+                    if branch:
+                        parts.append(f"branch: {branch}")
+                    if title and title != sf.stem:
+                        parts.append(str(title)[:60])
+                    lines.append(f"- {' | '.join(parts)}")
+                lines.append("")
+
+    content = "\n".join(lines) + "\n"
+
+    # Write the index
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(content)
+
+    if verbose:
+        print(f"[index] Generated {output_path.relative_to(BROOMVA_ROOT)}")
+        print(f"  {total_count} entities across {len(entities_by_type)} types")
+
+    return content
+
+
 # ── CLI Subcommands ───────────────────────────────────────────────────────────
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -1474,14 +1822,15 @@ def cmd_synthesize(args: argparse.Namespace) -> None:
 
 
 def cmd_lint(args: argparse.Namespace) -> None:
-    """Validate entity pages for frontmatter correctness and broken wikilinks."""
+    """Validate entity pages for frontmatter correctness, broken wikilinks, and contradictions."""
+    contradictions: list[Contradiction] = []
     if args.all or not args.file:
-        errors = lint_all(verbose=args.verbose)
+        errors, contradictions = lint_all(verbose=args.verbose)
     else:
         path = Path(args.file)
         errors = lint_entity_page(path)
 
-    if not errors:
+    if not errors and not contradictions:
         print("[lint] No errors found.")
         return
 
@@ -1493,7 +1842,15 @@ def cmd_lint(args: argparse.Namespace) -> None:
         file_name = Path(e.file_path).name
         print(f"[{label}] {file_name}: {e.field} — {e.message}")
 
-    print(f"\n[lint] {len(errors)} issues: {error_count} errors, {warning_count} warnings")
+    if contradictions:
+        print(f"\n[lint] {len(contradictions)} potential contradictions:")
+        for c in contradictions:
+            print(f"  [{c.confidence:.2f}] {c.note_a} vs {c.note_b}")
+            print(f"    A: {c.claim_a[:100]}")
+            print(f"    B: {c.claim_b[:100]}")
+
+    total_issues = len(errors) + len(contradictions)
+    print(f"\n[lint] {total_issues} issues: {error_count} errors, {warning_count} warnings, {len(contradictions)} contradictions")
     if error_count > 0:
         sys.exit(1)
 
@@ -1506,6 +1863,33 @@ def cmd_status(_args: argparse.Namespace) -> None:
 def cmd_query(args: argparse.Namespace) -> None:
     """Find and display an entity page."""
     run_query(args.slug, verbose=getattr(args, "verbose", False))
+
+
+def cmd_file(args: argparse.Namespace) -> None:
+    """File a valuable synthesis answer into the knowledge graph."""
+    if not args.content:
+        print("[file] ERROR: --content is required", file=sys.stderr)
+        sys.exit(1)
+
+    file_knowledge(
+        content=args.content,
+        slug=args.slug,
+        entity_type=args.type,
+        dry_run=args.dry_run,
+        verbose=args.verbose,
+    )
+
+
+def cmd_index(args: argparse.Namespace) -> None:
+    """Generate LLM-readable knowledge index at docs/knowledge-index.md."""
+    output_path = Path(args.output) if args.output else None
+    content = generate_knowledge_index(
+        output_path=output_path,
+        include_conversations=not args.no_conversations,
+        verbose=True,
+    )
+    if args.stdout:
+        print(content)
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
@@ -1567,6 +1951,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_query.add_argument("slug", help="Entity slug (fuzzy matched)")
     p_query.add_argument("--verbose", "-v", action="store_true")
     p_query.set_defaults(func=cmd_query)
+
+    # file
+    p_file = sub.add_parser("file", help="File a synthesis answer into the knowledge graph")
+    p_file.add_argument("--content", required=True, help="Content to file as an entity page")
+    p_file.add_argument("--slug", required=True, help="Entity slug (filesystem-safe name)")
+    p_file.add_argument("--type", default="concept", choices=ENTITY_TYPES, help="Entity type (default: concept)")
+    p_file.add_argument("--dry-run", action="store_true", help="Preview without writing files")
+    p_file.add_argument("--verbose", "-v", action="store_true")
+    p_file.set_defaults(func=cmd_file)
+
+    # index
+    p_index = sub.add_parser("index", help="Generate LLM-readable knowledge index")
+    p_index.add_argument("--output", metavar="FILE", help="Output path (default: docs/knowledge-index.md)")
+    p_index.add_argument("--no-conversations", action="store_true", help="Exclude recent sessions section")
+    p_index.add_argument("--stdout", action="store_true", help="Also print to stdout")
+    p_index.set_defaults(func=cmd_index)
 
     return parser
 
