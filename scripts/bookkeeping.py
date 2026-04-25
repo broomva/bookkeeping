@@ -810,13 +810,36 @@ def scatter(scored: ScoredItem, verbose: bool = False) -> list[str]:
 
     Returns the list of candidate slugs from the scorer, augmented by
     content analysis for items that had no LLM-derived candidates.
+    Also discovers person entity candidates from item authors (BRO-636).
     """
     candidates = list(scored.candidate_entities)
     if not candidates:
         candidates = _build_entity_slug_candidates(scored.item)
+
+    # BRO-636: Person entity auto-discovery from author field
+    author = scored.item.author
+    if author and len(author) >= 3:
+        # Normalize handle to a person entity slug
+        person_slug = slugify(author.lstrip("@"))
+        if person_slug and person_slug not in candidates:
+            candidates.append(person_slug)
+            if verbose:
+                print(f"  scatter → person candidate: {person_slug}")
+
     if verbose and candidates:
         print(f"  scatter → {candidates}")
     return candidates
+
+
+# Track author contributions for person entity creation
+_author_contributions: dict[str, list[str]] = {}
+
+
+def _track_person_contribution(author: str, entity_slug: str) -> None:
+    """Track that an author contributed to an entity (for person entity creation)."""
+    if author and len(author) >= 3:
+        key = slugify(author.lstrip("@"))
+        _author_contributions.setdefault(key, []).append(entity_slug)
 
 
 # ── Stage 4: Resolve ──────────────────────────────────────────────────────────
@@ -914,6 +937,10 @@ Source: {source_ref} | Score: {score}/9 (n={novelty} s={specificity} r={relevanc
 
 def _infer_entity_type(slug: str, item: RawItem) -> str:
     """Guess entity type from slug and content."""
+    # BRO-636: Check if slug matches an author handle (person entity)
+    author_slug = slugify((item.author or "").lstrip("@"))
+    if author_slug and slug == author_slug:
+        return "person"
     text = (slug + " " + item.content).lower()
     if any(w in text for w in ["pattern", "approach", "method", "strategy", "technique"]):
         return "pattern"
@@ -985,6 +1012,9 @@ def promote_item(
     page = template
     for key, value in content_map.items():
         page = page.replace("{" + key + "}", value)
+
+    # BRO-635: New entities from pipeline promotion start as "entity", not "raw"
+    page = re.sub(r"^status:\s*raw\s*$", "status: entity", page, flags=re.MULTILINE)
 
     if not dry_run:
         entity_dir.mkdir(parents=True, exist_ok=True)
@@ -1509,6 +1539,7 @@ def run_pipeline(
         "contradictions": len(contradictions),
         "knowledge_gaps": len(gaps),
         "scoring_breakdown": scoring_breakdown,
+        "judge_calls": scoring_breakdown.get("llm_judge", 0),
         "duration_seconds": duration,
     }
 
@@ -1562,6 +1593,74 @@ def _refresh_status_cache() -> dict:
                 status = fm.get("status", "unknown") if fm else "unknown"
                 stats["by_status"][status] = stats["by_status"].get(status, 0) + 1
 
+    # ── Scoring distribution (BRO-641) ──
+    score_histogram: dict[str, int] = {str(i): 0 for i in range(10)}
+    all_novelty: list[int] = []
+    all_specificity: list[int] = []
+    all_relevance: list[int] = []
+    blog_candidates: list[dict] = []
+
+    if ENTITIES_DIR.exists():
+        for md_file in ENTITIES_DIR.rglob("*.md"):
+            try:
+                text = md_file.read_text(errors="replace")
+                fm, _ = parse_frontmatter(text)
+                score = 0
+                n = s = r = 0
+                tags: list[str] = []
+                if fm:
+                    scoring = fm.get("scoring", {})
+                    if isinstance(scoring, dict):
+                        score = int(scoring.get("raw_score", 0))
+                        n = int(scoring.get("novelty", 0))
+                        s = int(scoring.get("specificity", 0))
+                        r = int(scoring.get("relevance", 0))
+                    tags = fm.get("tags", []) or []
+                    if isinstance(tags, str):
+                        tags = [t.strip() for t in tags.split(",")]
+                if score == 0:
+                    m = re.search(r"Score:\s*(\d+)/9", text)
+                    if m:
+                        score = int(m.group(1))
+                key = str(min(score, 9))
+                score_histogram[key] = score_histogram.get(key, 0) + 1
+                if n:
+                    all_novelty.append(n)
+                if s:
+                    all_specificity.append(s)
+                if r:
+                    all_relevance.append(r)
+                if score >= 7:
+                    blog_candidates.append({
+                        "slug": md_file.stem,
+                        "score": score,
+                        "tags": tags[:5],
+                    })
+            except Exception:
+                continue
+
+    stats["scoring_distribution"] = score_histogram
+    stats["scoring_dimensions"] = {
+        "avg_novelty": round(sum(all_novelty) / len(all_novelty), 2) if all_novelty else 0,
+        "avg_specificity": round(sum(all_specificity) / len(all_specificity), 2) if all_specificity else 0,
+        "avg_relevance": round(sum(all_relevance) / len(all_relevance), 2) if all_relevance else 0,
+    }
+    stats["blog_candidates"] = sorted(blog_candidates, key=lambda x: -x["score"])
+
+    # ── Synthesis queue (BRO-637) ──
+    synth = find_synthesis_candidates()
+    pending_synthesis = []
+    for c in synth:
+        # Priority: entity_count * crude avg score (use 5 as default)
+        priority = c["entity_count"] * 5.0
+        pending_synthesis.append({
+            "topic": c["topic"],
+            "entity_count": c["entity_count"],
+            "entity_slugs": c["slugs"],
+            "priority": priority,
+        })
+    stats["pending_synthesis"] = sorted(pending_synthesis, key=lambda x: -x["priority"])
+
     if RUN_LOG.exists():
         lines = RUN_LOG.read_text().strip().splitlines()
         if lines:
@@ -1576,17 +1675,34 @@ def _refresh_status_cache() -> dict:
     return stats
 
 
-def run_status() -> None:
+def run_status(force_refresh: bool = False, show_synthesis: bool = False) -> None:
     """Print a formatted knowledge graph status report."""
     # Try cached stats first
     stats: dict = {}
-    if STATUS_CACHE.exists():
+    stale = False
+    if STATUS_CACHE.exists() and not force_refresh:
         try:
             stats = json.loads(STATUS_CACHE.read_text())
+            # Staleness check: warn if >24h old
+            updated_at = stats.get("updated_at", "")
+            if updated_at:
+                try:
+                    cache_time = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                    age = datetime.now(timezone.utc) - cache_time
+                    if age > timedelta(hours=24):
+                        stale = True
+                        print(
+                            f"[status] Warning: cache is {age.days}d {age.seconds//3600}h old. "
+                            "Use --force-refresh for live data.",
+                            file=sys.stderr,
+                        )
+                        stats = _refresh_status_cache()
+                except Exception:
+                    pass
         except Exception:
             pass
 
-    if not stats:
+    if not stats or force_refresh:
         stats = _refresh_status_cache()
 
     total = stats.get("total_entities", 0)
@@ -1614,6 +1730,37 @@ def run_status() -> None:
     print(f"Last run: {last_run}")
     print(f"Cache updated: {updated_at}")
 
+    # ── Scoring distribution (BRO-641) ──
+    scoring_dist = stats.get("scoring_distribution")
+    if scoring_dist:
+        parts = " ".join(f"{s}({scoring_dist.get(str(s), 0)})" for s in range(10))
+        print(f"\nScore distribution: {parts}")
+    scoring_dims = stats.get("scoring_dimensions")
+    if scoring_dims:
+        print(
+            f"  Avg novelty: {scoring_dims.get('avg_novelty', 0):.1f} | "
+            f"Avg specificity: {scoring_dims.get('avg_specificity', 0):.1f} | "
+            f"Avg relevance: {scoring_dims.get('avg_relevance', 0):.1f}"
+        )
+    blog_candidates = stats.get("blog_candidates", [])
+    if blog_candidates:
+        print(f"\nBlog candidates (score ≥7): {len(blog_candidates)}")
+        for bc in blog_candidates[:5]:
+            print(f"  {bc['slug']} (score={bc['score']}, tags={', '.join(bc.get('tags', [])[:3])})")
+
+    # ── Synthesis queue (BRO-637) ──
+    if show_synthesis:
+        pending = stats.get("pending_synthesis", [])
+        if pending:
+            print(f"\nPending synthesis candidates: {len(pending)}")
+            for ps in pending[:10]:
+                print(
+                    f"  topic={ps['topic']!r} entities={ps['entity_count']} "
+                    f"priority={ps.get('priority', 0):.1f}"
+                )
+        else:
+            print("\nNo pending synthesis candidates.")
+
     # Show recent run log entries
     if RUN_LOG.exists():
         lines = RUN_LOG.read_text().strip().splitlines()
@@ -1628,6 +1775,7 @@ def run_status() -> None:
                         f"ingested={r.get('items_ingested',0)} "
                         f"promoted={r.get('items_promoted',0)} "
                         f"created={r.get('entities_created',0)} "
+                        f"judge={r.get('judge_calls',0)} "
                         f"({r.get('duration_seconds',0)}s)"
                     )
                 except Exception:
@@ -2035,9 +2183,70 @@ def cmd_lint(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
-def cmd_status(_args: argparse.Namespace) -> None:
+def cmd_promote_candidate(args: argparse.Namespace) -> None:
+    """Transition valid candidate entities to entity status (BRO-638)."""
+    if not ENTITIES_DIR.exists():
+        print("[promote-candidate] No entities directory.")
+        return
+
+    verbose = getattr(args, "verbose", False)
+    dry_run = getattr(args, "dry_run", False)
+    target_slug = getattr(args, "slug", None)
+    process_all = getattr(args, "all", False)
+
+    if not target_slug and not process_all:
+        print("[promote-candidate] Specify --slug <name> or --all")
+        return
+
+    promoted = 0
+    skipped = 0
+    for md_file in ENTITIES_DIR.rglob("*.md"):
+        if target_slug and md_file.stem != target_slug:
+            continue
+        text = md_file.read_text(errors="replace")
+        fm, body = parse_frontmatter(text)
+        if not fm:
+            skipped += 1
+            continue
+        status = fm.get("status", "")
+        if status != "candidate":
+            if verbose:
+                print(f"  skip {md_file.stem}: status={status!r} (not candidate)")
+            continue
+        # Validate: core_claim present, has content
+        core_claim = fm.get("core_claim", "")
+        if not core_claim or len(core_claim.strip()) < 5:
+            if verbose:
+                print(f"  skip {md_file.stem}: missing core_claim")
+            skipped += 1
+            continue
+        # Transition
+        if not dry_run:
+            updated = re.sub(
+                r"(^status:\s*)candidate\s*$",
+                r"\g<1>entity",
+                text,
+                flags=re.MULTILINE,
+            )
+            md_file.write_text(updated)
+        promoted += 1
+        if verbose:
+            action = "would promote" if dry_run else "promoted"
+            print(f"  {action}: {md_file.stem}")
+
+    print(f"[promote-candidate] Promoted: {promoted} | Skipped: {skipped}")
+    if dry_run:
+        print("  [DRY RUN] No files written.")
+    elif promoted > 0:
+        _refresh_status_cache()
+
+
+def cmd_status(args: argparse.Namespace) -> None:
     """Print knowledge graph statistics."""
-    run_status()
+    run_status(
+        force_refresh=getattr(args, "force_refresh", False),
+        show_synthesis=getattr(args, "synthesis", False),
+    )
 
 
 def cmd_query(args: argparse.Namespace) -> None:
@@ -2219,7 +2428,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     # status
     p_status = sub.add_parser("status", help="Print knowledge graph stats")
+    p_status.add_argument("--force-refresh", action="store_true", help="Force-refresh from filesystem (ignore cache)")
+    p_status.add_argument("--synthesis", action="store_true", help="Show pending synthesis candidates")
     p_status.set_defaults(func=cmd_status)
+
+    # promote-candidate
+    p_pc = sub.add_parser("promote-candidate", help="Transition valid candidates to entity status")
+    p_pc.add_argument("--all", action="store_true", help="Process all candidate entities")
+    p_pc.add_argument("--slug", help="Specific entity slug to promote")
+    p_pc.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    p_pc.add_argument("--verbose", "-v", action="store_true")
+    p_pc.set_defaults(func=cmd_promote_candidate)
 
     # query
     p_query = sub.add_parser("query", help="Find and display an entity page")
@@ -2259,6 +2478,12 @@ def main() -> None:
         print(
             "[bookkeeping] Note: google-generativeai not installed. "
             "LLM judge disabled (heuristic-only scoring).",
+            file=sys.stderr,
+        )
+    elif not os.environ.get("GEMINI_API_KEY"):
+        print(
+            "[bookkeeping] Warning: GEMINI_API_KEY not set. "
+            "LLM judge disabled; items scoring 3-6 will use heuristic only.",
             file=sys.stderr,
         )
     if not _YAML_AVAILABLE:
