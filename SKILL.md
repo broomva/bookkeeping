@@ -26,12 +26,29 @@ The bookkeeping skill is **bstack primitive P8**: the universal knowledge bookke
 
 ## When to Invoke
 
+**Reflexive triggers (run without being asked):**
+
 - After any knowledge-gathering session: social engagement runs, research experiments, deep-dive sessions, conversation transcripts
+- **Before committing any feature/page that reads knowledge-graph artifacts** — `~/.config/bookkeeping/status.json`, `research/entities/`, or any `bookkeeping.json` exported into a `public/` directory. Running the pipeline first guarantees the data the surface renders is current.
+- **Before committing a synced snapshot** to a public-facing surface (e.g. `apps/*/public/data/bookkeeping.json`). The committed copy must reflect a fresh run.
+- **At the close of any substantial work session that produced graph-relevant material** — new names, decisions, concepts, threads (recruiter outreach, partnership analyses, architecture debates, design reviews). The pipeline ingests, scores, and promotes so nothing is lost between sessions.
+- Before creating synthesis notes or flagging blog post candidates
+- After importing or scraping new sources (research notes, web clips, manual extracts)
+- When entity pages are stale or lint errors are detected in the entity graph
+
+**Explicit triggers:**
+
 - When prompted with `/bookkeeping` or `bookkeeping run`
 - Automatically after the `social-intelligence` loop runs (Phase 2 — Knowledge Extraction — is fully delegated here)
-- Before creating synthesis notes or flagging blog post candidates
 - When asked to "extract knowledge from", "distill", "index", or "promote" any content
-- When entity pages are stale or lint errors are detected in the entity graph
+
+**Mental checklist before declaring graph-dependent work done:**
+
+1. Did this session produce material that belongs in the entity graph?
+2. Does the feature I just built read from graph state?
+3. Am I about to commit a snapshot of graph state?
+
+If the answer is yes to any of the above and bookkeeping hasn't run this session, run it now — without being asked.
 
 ---
 
