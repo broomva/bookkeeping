@@ -50,6 +50,22 @@ The bookkeeping skill is **bstack primitive P8**: the universal knowledge bookke
 
 If the answer is yes to any of the above and bookkeeping hasn't run this session, run it now — without being asked.
 
+### Self-validation (`bookkeeping doctor`)
+
+The skill ships with a self-check that ensures the reflexive trigger rule is installed in the host workspace's governance files (`AGENTS.md`, `CLAUDE.md`, or `METALAYER.md`):
+
+```bash
+python3 skills/bookkeeping/scripts/bookkeeping.py doctor          # check
+python3 skills/bookkeeping/scripts/bookkeeping.py doctor --fix    # check + auto-inject into AGENTS.md
+python3 skills/bookkeeping/scripts/bookkeeping.py doctor --quiet  # check, only print on failure (for hooks)
+```
+
+Exit codes: `0` = installed, `1` = missing, `2` = `--fix` requested but no host AGENTS.md found.
+
+**Auto-nag**: `bookkeeping run` calls the doctor in quiet mode once per 24 hours. If the rule is missing in the host, you'll see a one-line warning on stderr — non-blocking. Run `doctor --fix` to silence it permanently.
+
+**On install / new host**: the first command any new host should run is `bookkeeping doctor --fix` to confirm the rule is present (or install it). Add it to the host's onboarding checklist or a session-start hook.
+
 ---
 
 ## Pipeline — 7 Stages

@@ -48,6 +48,30 @@ PROMOTE_THRESHOLD = 5
 DISCARD_THRESHOLD = 2
 IMMEDIATE_PROMOTE_THRESHOLD = 7
 LLM_JUDGE_AMBIGUOUS_LOW = 3
+
+# ── Reflexive trigger rule ────────────────────────────────────────────────────
+# This skill enforces a workspace-level rule: bookkeeping is invoked
+# reflexively (without prompting) when graph artifacts are touched, public
+# snapshots are synced, or a substantial work session concludes with
+# graph-relevant material. The marker below is grep'd to verify hosts.
+
+RULE_MARKER = "Reflexive Trigger Rule"
+
+RULE_SNIPPET = """\
+**Reflexive Trigger Rule (binding on every agent in this workspace)**:
+
+Bookkeeping is a reflex, not a request. Agents must invoke `python3 skills/bookkeeping/scripts/bookkeeping.py run` without being prompted in any of these situations:
+
+1. **Before committing a feature/page that reads from the graph** — anything that consumes `~/.config/bookkeeping/status.json`, `research/entities/`, or a `public/data/bookkeeping.json` snapshot. The data must be fresh at commit time.
+2. **Before committing a synced snapshot to a public surface** — e.g. `apps/*/public/data/bookkeeping.json`. The committed copy must reflect a freshly-run pipeline.
+3. **At the close of any substantial work session that produced graph-relevant material** — new names, decisions, concepts, partnerships, threads, design debates. The pipeline ingests/scores/promotes so the next session starts with that material indexed.
+
+Mental checklist before declaring graph-dependent work done: *Did this session produce material that belongs in the graph? Does my feature read graph state? Am I about to commit a snapshot?* — yes to any → run bookkeeping before committing.
+
+This rule is enforced by `bookkeeping doctor` (run it to verify your host workspace has the rule installed).
+"""
+
+DOCTOR_STATE_FILE = CONFIG_DIR / "doctor-state.json"
 LLM_JUDGE_AMBIGUOUS_HIGH = 6
 
 ENTITY_TYPES = [
@@ -2031,10 +2055,195 @@ def generate_knowledge_index(
     return content
 
 
+# ── Reflexive Rule Doctor ─────────────────────────────────────────────────────
+#
+# Self-validation: ensure every host workspace where the skill is installed
+# carries the Reflexive Trigger Rule. Runs in three modes:
+#
+#   bookkeeping doctor         → check, exit 1 if missing
+#   bookkeeping doctor --fix   → check; inject snippet into AGENTS.md if missing
+#   bookkeeping doctor --quiet → check; only print on failure (for hooks)
+#
+# Also called from cmd_run() once per day (gated by DOCTOR_STATE_FILE) so
+# users get nagged but not flooded.
+
+
+def _candidate_governance_files() -> list[Path]:
+    """Files in the host workspace that should carry the rule, in priority
+    order. The rule needs to live in at least one of these for compliance.
+    """
+    return [
+        BROOMVA_ROOT / "AGENTS.md",
+        BROOMVA_ROOT / "CLAUDE.md",
+        BROOMVA_ROOT / "METALAYER.md",
+    ]
+
+
+def _skill_self_files() -> list[Path]:
+    """The skill's own files that must declare the rule."""
+    return [SKILL_DIR / "SKILL.md"]
+
+
+def check_rule_installed() -> tuple[bool, list[Path], list[Path]]:
+    """Returns (ok, missing_governance, missing_skill).
+
+    The rule is considered installed if:
+      - At least ONE host governance file contains the marker
+      - The skill's own SKILL.md contains the marker
+    """
+    missing_gov: list[Path] = []
+    missing_skill: list[Path] = []
+
+    found_in_host = False
+    for path in _candidate_governance_files():
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if RULE_MARKER in text:
+            found_in_host = True
+        else:
+            missing_gov.append(path)
+
+    for path in _skill_self_files():
+        if not path.exists():
+            missing_skill.append(path)
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if RULE_MARKER not in text and "reflexive" not in text.lower():
+            missing_skill.append(path)
+
+    ok = found_in_host and not missing_skill
+    return ok, missing_gov, missing_skill
+
+
+def inject_rule_into_agents_md() -> Path | None:
+    """Append the rule snippet to the host AGENTS.md (preferred location).
+    Returns the path written to, or None if no suitable file exists.
+    """
+    target = BROOMVA_ROOT / "AGENTS.md"
+    if not target.exists():
+        return None
+    text = target.read_text(encoding="utf-8")
+    if RULE_MARKER in text:
+        return target  # already there
+    appended = (
+        text.rstrip()
+        + "\n\n## Bookkeeping — Reflexive Trigger Rule (auto-injected by `bookkeeping doctor --fix`)\n\n"
+        + RULE_SNIPPET
+        + "\n"
+    )
+    target.write_text(appended, encoding="utf-8")
+    return target
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    """Validate that the reflexive trigger rule is installed in the host."""
+    ok, missing_gov, missing_skill = check_rule_installed()
+
+    quiet = getattr(args, "quiet", False)
+    fix = getattr(args, "fix", False)
+
+    if ok:
+        if not quiet:
+            print("[doctor] ✓ Reflexive Trigger Rule is installed.")
+            for p in _candidate_governance_files():
+                if p.exists() and RULE_MARKER in p.read_text(
+                    encoding="utf-8", errors="ignore"
+                ):
+                    print(f"[doctor]   ↳ host:  {p}")
+            for p in _skill_self_files():
+                if p.exists():
+                    print(f"[doctor]   ↳ skill: {p}")
+        # Stamp last-checked so cmd_run can skip its nag for 24h.
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            DOCTOR_STATE_FILE.write_text(
+                json.dumps({"last_check_ok": now_iso()}), encoding="utf-8"
+            )
+        except OSError:
+            pass
+        return
+
+    # Failure path
+    print("[doctor] ✗ Reflexive Trigger Rule is NOT fully installed.")
+    if missing_skill:
+        print("[doctor]   skill files missing the rule:")
+        for p in missing_skill:
+            print(f"[doctor]     - {p}")
+    host_files = [p for p in _candidate_governance_files() if p.exists()]
+    if not any(
+        RULE_MARKER in p.read_text(encoding="utf-8", errors="ignore")
+        for p in host_files
+    ):
+        print(
+            "[doctor]   no host governance file (AGENTS.md / CLAUDE.md / "
+            "METALAYER.md) contains the rule."
+        )
+
+    if fix:
+        target = inject_rule_into_agents_md()
+        if target is None:
+            print(
+                "[doctor] ! --fix requested but no host AGENTS.md found at "
+                f"{BROOMVA_ROOT / 'AGENTS.md'}. Create it and rerun."
+            )
+            sys.exit(2)
+        print(f"[doctor] ✓ Injected rule snippet into {target}")
+        # Re-check
+        ok2, _, _ = check_rule_installed()
+        if ok2:
+            print("[doctor] ✓ Re-validated — rule is now installed.")
+            return
+        print("[doctor] ! Re-validation still failing. Inspect manually.")
+        sys.exit(2)
+
+    if not quiet:
+        print(
+            "\nFix:\n"
+            "  python3 skills/bookkeeping/scripts/bookkeeping.py doctor --fix\n"
+            "Or add the snippet manually:\n"
+        )
+        print(RULE_SNIPPET)
+    sys.exit(1)
+
+
+def _maybe_nag_about_rule() -> None:
+    """Called once at the start of `cmd_run` (gated by daily stamp).
+    Quiet warning if the rule isn't installed; never blocks the pipeline.
+    """
+    try:
+        if DOCTOR_STATE_FILE.exists():
+            stamp = json.loads(DOCTOR_STATE_FILE.read_text(encoding="utf-8"))
+            last = datetime.fromisoformat(stamp.get("last_check_ok", ""))
+            if (datetime.now(timezone.utc) - last) < timedelta(hours=24):
+                return  # checked OK recently
+    except (OSError, ValueError, KeyError):
+        pass
+
+    ok, _, _ = check_rule_installed()
+    if ok:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            DOCTOR_STATE_FILE.write_text(
+                json.dumps({"last_check_ok": now_iso()}), encoding="utf-8"
+            )
+        except OSError:
+            pass
+        return
+
+    print(
+        "[bookkeeping] ⚠ Reflexive Trigger Rule not detected in the host "
+        "workspace governance files. Run `python3 "
+        "skills/bookkeeping/scripts/bookkeeping.py doctor --fix` to install.",
+        file=sys.stderr,
+    )
+
+
 # ── CLI Subcommands ───────────────────────────────────────────────────────────
 
 def cmd_run(args: argparse.Namespace) -> None:
     """Execute the full 7-stage pipeline."""
+    _maybe_nag_about_rule()
     sources: list[Path] | None = None
     if args.source:
         sources = [Path(args.source)]
@@ -2467,6 +2676,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_wakeup.add_argument("--tokens", type=int, default=900, help="Token budget (default 900)")
     p_wakeup.add_argument("--output", type=str, metavar="FILE", help="Write output to file")
     p_wakeup.set_defaults(func=cmd_wakeup)
+
+    # doctor — verify the reflexive trigger rule is installed
+    p_doctor = sub.add_parser(
+        "doctor",
+        aliases=["bootstrap"],
+        help="Verify (and optionally install) the reflexive trigger rule in host governance files",
+    )
+    p_doctor.add_argument("--fix", action="store_true", help="Inject the rule into host AGENTS.md if missing")
+    p_doctor.add_argument("--quiet", action="store_true", help="Only print on failure (for hooks)")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     return parser
 
