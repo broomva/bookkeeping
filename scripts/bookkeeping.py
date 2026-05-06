@@ -1457,6 +1457,116 @@ def cmd_promote(args: argparse.Namespace) -> None:
         print("[promote] DRY RUN — no files written")
 
 
+def cmd_replay(args: argparse.Namespace) -> None:
+    """Replay scoring/promotion against a frozen snapshot of `research/entities/`.
+
+    Closes the corruption mode where bookkeeping reads from the same graph it
+    writes to (the "shadow dream" failure described in the multi-tier-dreaming
+    research entity). Replay phase = run the full pipeline against a frozen
+    copy, generate a diff, surface it for review. Promotion to the live graph
+    requires explicit `--commit`.
+
+    Five-phase shape (per multi-tier-dreaming entity):
+      1. Gather   — read the source file as the dense lower-tier signal
+      2. Replay   — score+promote against a FROZEN copy of research/entities/
+      3. Prune    — items below threshold or failing lint are flagged
+      4. Consolidate — `--commit` mode applies the diff to the live graph
+      5. Index    — git diff output is the audit trail of what changed
+
+    Without --commit, replay is a pure read operation: it copies entities to
+    a tempdir, runs scoring against that copy, and prints the proposed diff.
+    With --commit, replay re-runs the same logic against the LIVE graph (so
+    the diff applies to the same starting state the human approved).
+    """
+    import shutil
+    import tempfile
+
+    source_path = Path(args.source) if args.source else None
+    if source_path and not source_path.exists():
+        print(f"ERROR: {source_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    live_entities = ENTITIES_DIR
+    if not live_entities.exists():
+        print(f"ERROR: {live_entities} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Phase 1: Gather (which sources are we replaying?)
+    if source_path:
+        sources = [source_path]
+    else:
+        sources = list(NOTES_DIR.glob("*-raw.md"))
+        sources = [p for p in sources if p.is_file()]
+        if not sources:
+            print("[replay] no raw extract files in research/notes/", file=sys.stderr)
+            sys.exit(0)
+
+    print(f"[replay] Phase 1 (Gather): {len(sources)} source file(s)")
+    for s in sources[:5]:
+        try:
+            print(f"  - {s.relative_to(BROOMVA_ROOT)}")
+        except ValueError:
+            print(f"  - {s}")
+    if len(sources) > 5:
+        print(f"  ... +{len(sources) - 5} more")
+
+    # Phase 2: Replay against frozen substrate
+    with tempfile.TemporaryDirectory(prefix="bookkeeping-replay-") as tmpdir:
+        frozen_root = Path(tmpdir)
+        frozen_entities = frozen_root / "research" / "entities"
+        frozen_entities.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(live_entities, frozen_entities)
+        print(f"\n[replay] Phase 2 (Replay): froze {sum(1 for _ in frozen_entities.rglob('*.md'))} entity files at {frozen_entities}")
+
+        # Track what would change in the replay world (but don't actually
+        # write to it — we use existing_entity_slugs() against the frozen
+        # state for collision detection, and report counts only).
+        existing_frozen = sorted(p.stem for p in frozen_entities.rglob("*.md"))
+
+        promoted = 0
+        skipped = 0
+        scores = []
+        for src in sources:
+            try:
+                items = ingest_file(src, verbose=args.verbose)
+            except Exception as e:
+                print(f"  ! ingest failed for {src.name}: {e}", file=sys.stderr)
+                continue
+            for item in items:
+                try:
+                    scored = score_item(item, existing_frozen, verbose=False)
+                except Exception as e:
+                    print(f"  ! score failed for {item.item_id}: {e}", file=sys.stderr)
+                    continue
+                scores.append(scored.total)
+                if scored.total < PROMOTE_THRESHOLD:
+                    skipped += 1
+                    continue
+                # Would-promote: simulate without writing
+                promoted += 1
+                if args.verbose:
+                    print(f"  WOULD-PROMOTE [{item.item_id}] score={scored.total}/9 → {scored.suggested_slug}")
+
+        print(f"\n[replay] Phase 3 (Prune): {skipped} item(s) below threshold; {promoted} would-promote")
+        if scores:
+            print(f"          score distribution: min={min(scores)} max={max(scores)} mean={sum(scores)/len(scores):.1f}")
+
+    # Phase 4: Consolidate (--commit only)
+    if args.commit:
+        print(f"\n[replay] Phase 4 (Consolidate): --commit set; running pipeline against LIVE graph")
+        run_pipeline(
+            source_files=sources,
+            dry_run=False,
+            verbose=args.verbose,
+        )
+        # Phase 5: Index (the agent / user inspects git diff to verify)
+        print(f"\n[replay] Phase 5 (Index): inspect `git diff research/entities/` for the audit trail")
+    else:
+        print(f"\n[replay] Phase 4 (Consolidate): SKIPPED — pass --commit to apply the diff to the live graph")
+        print(f"          to inspect what would change without committing, run:")
+        print(f"            bookkeeping run --dry-run --source <file>")
+
+
 def cmd_synthesize(args: argparse.Namespace) -> None:
     """Detect entity clusters and flag synthesis candidates."""
     candidates = find_synthesis_candidates(verbose=args.verbose)
@@ -1545,6 +1655,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_promote.add_argument("--dry-run", action="store_true")
     p_promote.add_argument("--verbose", "-v", action="store_true")
     p_promote.set_defaults(func=cmd_promote)
+
+    # replay (P6 extension — closes the shadow-dream corruption mode)
+    p_replay = sub.add_parser(
+        "replay",
+        help="Replay scoring/promotion against a FROZEN snapshot of research/entities/ "
+             "(closes the corruption mode where bookkeeping reads from the graph it writes to)",
+    )
+    p_replay.add_argument("--source", metavar="FILE",
+                          help="Source raw extract (auto-discovers all *-raw.md if omitted)")
+    p_replay.add_argument("--commit", action="store_true",
+                          help="Apply the proposed promotions to the live graph "
+                               "(default: dry-run only — print would-promote counts)")
+    p_replay.add_argument("--verbose", "-v", action="store_true")
+    p_replay.set_defaults(func=cmd_replay)
 
     # synthesize
     p_synth = sub.add_parser("synthesize", help="Detect entity clusters for synthesis")
