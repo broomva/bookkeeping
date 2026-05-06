@@ -33,6 +33,17 @@ The bookkeeping skill is **bstack primitive P8**: the universal knowledge bookke
 - When asked to "extract knowledge from", "distill", "index", or "promote" any content
 - When entity pages are stale or lint errors are detected in the entity graph
 
+## Reflexive Trigger Rule (binding on every agent in this workspace)
+
+Bookkeeping is a reflex, not a request. Agents must invoke `bookkeeping.py` without being prompted in any of these situations:
+
+1. **Before committing a feature/page that reads from the graph** — anything consuming `~/.config/bookkeeping/status.json`, `research/entities/`, or a snapshot at `apps/*/public/data/bookkeeping.json`. The data must be fresh at commit time.
+2. **Before committing a synced snapshot to a public surface** — e.g., `apps/*/public/data/bookkeeping.json`. The committed copy must reflect a freshly-run pipeline.
+3. **At the close of any substantial work session that produced graph-relevant material** — new names, decisions, concepts, partnerships, threads, design debates. The pipeline ingests/scores/promotes so the next session starts indexed.
+4. **Before a substantial promotion run, prefer `bookkeeping replay` over `bookkeeping run`** — `run` reads from the live graph it writes to (the *shadow-dream* corruption mode). `replay` runs against a frozen snapshot first; review the diff; then `--commit` if the changes look right. Use `run` for small, well-scoped extractions; use `replay` for cross-source consolidation passes or any time the graph has grown materially since the last run.
+
+Mental checklist before declaring graph-dependent work done: *Did this session produce material that belongs in the graph? Does my feature read graph state? Am I about to commit a snapshot? Should I be using `replay --commit` instead of `run` here?* — yes to any → invoke bookkeeping before committing.
+
 ---
 
 ## Pipeline — 7 Stages
@@ -164,6 +175,8 @@ This SKILL.md is the single source of truth for all thresholds, stage definition
 
 ```bash
 python3 scripts/bookkeeping.py run                    # Full 7-stage pipeline
+python3 scripts/bookkeeping.py replay                 # Score against frozen snapshot (no writes)
+python3 scripts/bookkeeping.py replay --commit        # Apply replay's proposed promotions
 python3 scripts/bookkeeping.py ingest --source FILE   # Ingest single file
 python3 scripts/bookkeeping.py score --file FILE      # Score items in raw extract
 python3 scripts/bookkeeping.py promote --file FILE    # Promote pending items
@@ -174,6 +187,22 @@ python3 scripts/bookkeeping.py query "concept-slug"   # Find and display entity 
 ```
 
 All commands accept `--dry-run` to preview changes without writing. All commands write structured output to `~/.config/bookkeeping/run-log.jsonl`.
+
+### `replay` — closes the shadow-dream corruption mode
+
+`bookkeeping run` reads from the same graph it writes to. The local research entity at `research/entities/concept/multi-tier-dreaming.md` (scored 9/9) explicitly identifies this as a *"shadow dream"* — gather + consolidate without the **replay** phase. The corruption mode hasn't fired yet only because the graph is small.
+
+`replay` adds the missing replay phase:
+
+1. **Gather** — read the source files (or auto-discover all `*-raw.md`)
+2. **Replay** — copy `research/entities/` into a tempdir; score+promote against the *frozen* copy
+3. **Prune** — items below threshold or failing lint are flagged; replay reports counts
+4. **Consolidate** — pass `--commit` to apply the proposed promotions to the live graph (re-runs the scoring against the live state to ensure idempotence)
+5. **Index** — `git diff research/entities/` is the audit trail; the agent or human inspects before merging
+
+Without `--commit`, replay is **read-only** — pure diagnostic. With `--commit`, replay re-runs the pipeline against the live graph (so the diff applies cleanly to the same starting state the human approved).
+
+Smoke-tested against the live workspace: 3 raw extracts gathered, 178 entities frozen in tmpdir, 96 items scored (15 below threshold, 81 would-promote, mean 5.4/9). No writes without `--commit`.
 
 ---
 
