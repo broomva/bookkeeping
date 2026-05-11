@@ -78,18 +78,37 @@ TECH_STOP_WORDS = {
     "they", "their", "our", "your", "my", "i", "me", "us", "him", "her",
 }
 
-# Optional LLM dependency
+# Optional LLM dependency (legacy Gemini judge)
 try:
     import google.generativeai as genai  # type: ignore
     _GENAI_AVAILABLE = True
 except ImportError:
     _GENAI_AVAILABLE = False
 
+# Optional LLM dependency (authored-agents Anthropic judge — BRO-1015)
+#
+# Loads the three blessed scorer agents from
+# ~/broomva/core/life/agents/bookkeeping-{novelty,specificity,relevance}.md
+# and calls them sequentially through the Anthropic API. Each agent
+# scores ONE dimension; we aggregate to the existing 0..=9 total. This
+# is the architecturally-aligned path: the agent prompts live in
+# version-controlled .md files (Layer 3 data per the authored-agents
+# spec), not embedded as Python string literals.
+try:
+    from anthropic import Anthropic  # type: ignore
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
+
 try:
     import yaml  # type: ignore
     _YAML_AVAILABLE = True
 except ImportError:
     _YAML_AVAILABLE = False
+
+# Resolves to ~/broomva/core/life/agents/. Each blessed bookkeeping
+# scorer is loaded from this directory at runtime.
+AUTHORED_AGENTS_DIR = BROOMVA_ROOT / "core" / "life" / "agents"
 
 
 # ── Data Classes ──────────────────────────────────────────────────────────────
@@ -685,13 +704,214 @@ def score_item_llm(item: RawItem, existing_slugs: list[str]) -> Optional[ScoredI
         return None
 
 
+# ── Authored-agents scorer (BRO-1015) ─────────────────────────────────────────
+#
+# Replaces the single-call Gemini judge with three parallel calls to the
+# blessed bookkeeping scorer agents at
+# ~/broomva/core/life/agents/bookkeeping-{novelty,specificity,relevance}.md.
+#
+# Why this matters: the agent prompts are version-controlled Layer-3 data
+# (per the authored-agents architecture). When a maintainer wants to
+# tune the novelty scorer, they edit `bookkeeping-novelty.md` and PR it
+# — every Python pipeline run reads the updated prompt. No code change
+# required in `bookkeeping.py`.
+#
+# The authored-agents path is preferred over Gemini when:
+# - ANTHROPIC_API_KEY is set AND
+# - `anthropic` Python SDK is installed AND
+# - The three .md files exist at AUTHORED_AGENTS_DIR
+#
+# Falls back to Gemini, then heuristic-only, when those aren't met.
+
+
+def _load_agent_spec(name: str) -> Optional[dict]:
+    """
+    Load an authored agent spec from disk and return its parsed
+    frontmatter + body. Returns None if the file doesn't exist, can't
+    be parsed, or `yaml` isn't available (PyYAML is an optional dep).
+
+    The schema mirrors `ergon::parse_agent_md`: the body is the agent's
+    `instructions`, the YAML frontmatter holds `model`, `max_turns`,
+    `input_schema`, `output_schema`, etc.
+    """
+    if not _YAML_AVAILABLE:
+        return None
+    path = AUTHORED_AGENTS_DIR / f"{name}.md"
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text()
+        # Frontmatter is delimited by `---` at the top of the file.
+        if not text.startswith("---\n"):
+            return None
+        end = text.find("\n---\n", 4)
+        if end < 0:
+            return None
+        frontmatter = yaml.safe_load(text[4:end])
+        body = text[end + 5 :].strip()
+        if not isinstance(frontmatter, dict) or not body:
+            return None
+        return {
+            "name": frontmatter.get("name", name),
+            "model": frontmatter.get("model", "claude-haiku-4-5"),
+            "max_turns": frontmatter.get("max_turns", 1),
+            "input_schema": frontmatter.get("input_schema", {}),
+            "output_schema": frontmatter.get("output_schema", {}),
+            "instructions": body,
+        }
+    except Exception:
+        return None
+
+
+def _call_authored_scorer(
+    spec: dict,
+    item: RawItem,
+    existing_slugs: list[str],
+    client,
+) -> Optional[dict]:
+    """
+    Invoke one authored bookkeeping-* scorer against the Anthropic API.
+
+    Builds the prompt from the agent's `instructions` (loaded verbatim
+    from the .md body), passes the item's text as the input matching
+    the agent's `input_schema`, asks the model to return JSON matching
+    `output_schema`. Validates the structure and returns the parsed
+    response dict, or None on any failure (so the caller can fall back
+    to the next path).
+    """
+    # The input shape follows each agent's declared input_schema.
+    # All three scorers accept {item_text, source_type, ...}; relevance
+    # additionally accepts active_projects / open_questions.
+    agent_input = {
+        "item_text": item.content[:2000],
+        "source_type": item.source_type,
+        "source_url": item.source_url or "",
+    }
+    if spec["name"] == "bookkeeping-novelty":
+        agent_input["existing_entity_slugs"] = existing_slugs[:40]
+    if spec["name"] == "bookkeeping-relevance":
+        # Best-effort population. Concrete active projects / open
+        # questions could be threaded through from upstream; this is
+        # the minimum that lets the agent score above 0.
+        agent_input["active_projects"] = [
+            "life-agent-os", "ergon", "lago", "arcan", "haima", "anima", "nous", "praxis",
+        ]
+        agent_input["open_questions"] = []
+
+    system = spec["instructions"]
+    user = (
+        "Score the following item. Reply with ONLY a JSON object matching the agent's "
+        "output_schema. No prose outside the JSON.\n\n"
+        f"Input (matches `{spec['name']}` input_schema):\n"
+        f"```json\n{json.dumps(agent_input, indent=2)}\n```\n\n"
+        "Required output shape (the agent's `output_schema` — populate every required field):\n"
+        f"```json\n{json.dumps(spec['output_schema'], indent=2)}\n```"
+    )
+
+    try:
+        response = client.messages.create(
+            model=spec["model"],
+            max_tokens=1024,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        # Concatenate text blocks (Anthropic returns a list of content blocks)
+        raw = "".join(
+            block.text for block in response.content if getattr(block, "type", "") == "text"
+        ).strip()
+        # Strip markdown code fences if the model added them anyway.
+        raw = re.sub(r"^```json?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+        # Minimum required fields per agent's output_schema.
+        if not isinstance(data, dict) or "score" not in data:
+            return None
+        score = data.get("score")
+        if not isinstance(score, int) or not (0 <= score <= 3):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def score_item_authored_agents(
+    item: RawItem, existing_slugs: list[str]
+) -> Optional[ScoredItem]:
+    """
+    Score a RawItem using the three blessed bookkeeping scorer agents
+    (BRO-1012). Returns None if the path is unavailable (no API key, no
+    SDK, missing agent files) so the caller can fall back.
+    """
+    if not _ANTHROPIC_AVAILABLE:
+        return None
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return None
+
+    specs = {
+        dim: _load_agent_spec(f"bookkeeping-{dim}")
+        for dim in ("novelty", "specificity", "relevance")
+    }
+    if not all(specs.values()):
+        return None
+
+    try:
+        client = Anthropic(api_key=api_key)
+    except Exception:
+        return None
+
+    results = {}
+    reasoning = {}
+    for dim, spec in specs.items():
+        out = _call_authored_scorer(spec, item, existing_slugs, client)
+        if out is None:
+            return None  # any-call failure → fall back to next scorer
+        results[dim] = out["score"]
+        # Each scorer's `reasoning` field is a single string; we
+        # aggregate under the dimension key for the ScoredItem.reasoning
+        # dict.
+        reasoning[f"{dim}_reasoning"] = out.get("reasoning", "")
+        # Capture anti-pattern self-reports if the scorer set any.
+        warnings = out.get("anti_pattern_warnings") or []
+        if warnings:
+            reasoning[f"{dim}_anti_patterns"] = warnings
+
+    novelty = results["novelty"]
+    specificity = results["specificity"]
+    relevance = results["relevance"]
+    total = novelty + specificity + relevance
+
+    # Candidate-entity extraction: novelty agent surfaces
+    # `closest_existing_slug` when score < 3. Use that as the candidate
+    # slug; otherwise build from content.
+    candidates = []
+    nov_out = results.get("novelty_full") or {}
+    # _call_authored_scorer returned only the score, not the full dict.
+    # We need to re-thread the closest_existing_slug if available; for
+    # now build candidates from content as a fallback.
+    candidates = _build_entity_slug_candidates(item)
+
+    return ScoredItem(
+        item=item,
+        novelty=novelty,
+        specificity=specificity,
+        relevance=relevance,
+        total=total,
+        promote=total >= PROMOTE_THRESHOLD,
+        candidate_entities=candidates,
+        scoring_method="authored_agents",
+        reasoning=reasoning,
+    )
+
+
 def score_item(item: RawItem, existing_slugs: list[str], verbose: bool = False) -> ScoredItem:
     """
     Two-pass scorer: heuristic fast-path, then LLM for ambiguous band.
 
     - Score ≤ DISCARD_THRESHOLD (2): discard immediately, no LLM call.
     - Score ≥ IMMEDIATE_PROMOTE_THRESHOLD (7): promote immediately, no LLM call.
-    - Score 3-6: call LLM judge if available, else keep heuristic result.
+    - Score 3-6: call LLM judge (authored agents preferred, Gemini fallback,
+      heuristic-only last resort).
     """
     h = score_item_heuristic(item)
 
@@ -703,11 +923,22 @@ def score_item(item: RawItem, existing_slugs: list[str], verbose: bool = False) 
             )
         return h
 
-    # Ambiguous band: try LLM judge
+    # Ambiguous band: try the authored-agents path first (BRO-1015 —
+    # version-controlled .md prompts at core/life/agents/), fall back to
+    # the legacy single-call Gemini judge, then to heuristic-only.
     if verbose:
         print(
-            f"  [{item.item_id}] heuristic={h.total}/9 → LLM judge..."
+            f"  [{item.item_id}] heuristic={h.total}/9 → judge (authored agents first)..."
         )
+    authored = score_item_authored_agents(item, existing_slugs)
+    if authored is not None:
+        if verbose:
+            print(
+                f"  [{item.item_id}] authored_agents={authored.total}/9 "
+                f"(n={authored.novelty} s={authored.specificity} r={authored.relevance})"
+            )
+        return authored
+
     llm_result = score_item_llm(item, existing_slugs)
     if llm_result is not None:
         if verbose:
