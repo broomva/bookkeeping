@@ -305,17 +305,17 @@ def extract_wikilinks_html(text: str) -> list[tuple[str, str]]:
     """
     results: list[tuple[str, str]] = []
     for tag in re.findall(r"<a\b([^>]*?)>", text, flags=re.IGNORECASE):
-        href_m = re.search(r'\bhref\s*=\s*"([^"]*)"', tag, flags=re.IGNORECASE)
-        rel_m = re.search(r'\bdata-relation\s*=\s*"([^"]*)"', tag, flags=re.IGNORECASE)
+        href_m = re.search(r"""\bhref\s*=\s*(["'])([^"']*)\1""", tag, flags=re.IGNORECASE)
+        rel_m = re.search(r"""\bdata-relation\s*=\s*(["'])([^"']*)\1""", tag, flags=re.IGNORECASE)
         if not href_m or not rel_m:
             continue
-        href = href_m.group(1)
+        href = href_m.group(2)
         if re.match(r"^(?:https?:|mailto:|#)", href, flags=re.IGNORECASE):
             continue
         # Strip leading ./ or ../ segments, then the .md/.html extension.
         slug = re.sub(r"^(?:\.{1,2}/)+", "", href)
         slug = re.sub(r"\.(?:md|html)$", "", slug, flags=re.IGNORECASE)
-        results.append((slug, rel_m.group(1)))
+        results.append((slug, rel_m.group(2)))
     return results
 
 
