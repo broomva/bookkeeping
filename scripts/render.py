@@ -23,6 +23,8 @@ TEMPLATES_DIR = SCRIPTS_DIR.parent / "templates"
 TEMPLATE_HTML = TEMPLATES_DIR / "render-template.html"
 TEMPLATE_CSS = TEMPLATES_DIR / "render-style.css"
 
+WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
+
 
 def _load_template() -> Template:
     """Load the HTML template (string.Template with ${name} placeholders)."""
@@ -70,6 +72,31 @@ def _canonical_href(source_path: Path) -> str:
     return f"./{source_path.name}"
 
 
+def _rewrite_wikilinks(md_text: str, source_path: Path, link_html: bool) -> str:
+    """
+    Rewrite [[slug]] and [[slug|alias]] into typed inline HTML anchors.
+
+    mistune in escape=False mode passes inline HTML through unchanged, so
+    the resulting <a> tags survive markdown rendering with all attributes
+    intact. Targets are .md by default, .html when link_html=True (for
+    full-graph projection runs).
+    """
+    suffix = ".html" if link_html else ".md"
+
+    def repl(m: re.Match) -> str:
+        raw = m.group(1).strip()
+        target, _, alias = raw.partition("|")
+        target = target.strip()
+        alias = alias.strip() or target.rsplit("/", 1)[-1]
+        if "/" in target:
+            href = f"../{target}{suffix}"
+        else:
+            href = f"./{target}{suffix}"
+        return f'<a href="{href}" data-relation="references">{alias}</a>'
+
+    return WIKILINK_RE.sub(repl, md_text)
+
+
 def _build_renderer() -> mistune.Markdown:
     """
     Deterministic markdown renderer.
@@ -83,7 +110,11 @@ def _build_renderer() -> mistune.Markdown:
     )
 
 
-def render_markdown_to_html(md_text: str, source_path: Path) -> str:
+def render_markdown_to_html(
+    md_text: str,
+    source_path: Path,
+    link_html: bool = False,
+) -> str:
     """
     Render a markdown string to a complete single-file HTML document.
 
@@ -91,11 +122,14 @@ def render_markdown_to_html(md_text: str, source_path: Path) -> str:
         md_text: Raw markdown including optional YAML frontmatter.
         source_path: Path of the source .md file; used for canonical link
             and title fallback (filename → title if no frontmatter title).
+        link_html: If True, wikilinks resolve to sibling .html files (for
+            full-graph projection). Default False → sibling .md targets.
 
     Returns:
         Complete HTML document as a string. Deterministic across runs.
     """
     fm, body_md = _split_frontmatter(md_text)
+    body_md = _rewrite_wikilinks(body_md, source_path, link_html)
     canonical_href = _canonical_href(source_path)
     title = fm.get("title") or fm.get("slug") or source_path.stem
     body_html = _build_renderer()(body_md).rstrip()

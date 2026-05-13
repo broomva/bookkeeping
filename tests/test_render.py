@@ -43,3 +43,32 @@ class TestRenderCore:
         h2 = render_markdown_to_html(md, source_path=Path("note.md"))
         h3 = render_markdown_to_html(md, source_path=Path("note.md"))
         assert h1 == h2 == h3
+
+
+class TestRenderWikilinkRewrite:
+    def test_md_target_default(self):
+        md = "See [[concept/foo]] for context."
+        html = render_markdown_to_html(md, source_path=Path("research/notes/x.md"))
+        assert 'href="../concept/foo.md"' in html
+        assert 'data-relation="references"' in html
+        assert ">foo<" in html  # display text is the leaf segment
+
+    def test_html_target_with_flag(self):
+        md = "See [[concept/foo]]."
+        html = render_markdown_to_html(
+            md, source_path=Path("research/notes/x.md"), link_html=True
+        )
+        assert 'href="../concept/foo.html"' in html
+        assert "concept/foo.md" not in html
+
+    def test_pipe_alias_used_as_display(self):
+        md = "See [[concept/foo|Foo Concept]]."
+        html = render_markdown_to_html(md, source_path=Path("research/notes/x.md"))
+        assert ">Foo Concept<" in html
+        assert 'href="../concept/foo.md"' in html
+
+    def test_bare_slug_no_path(self):
+        # No slash → treated as a same-folder reference
+        md = "See [[foo]]."
+        html = render_markdown_to_html(md, source_path=Path("research/notes/x.md"))
+        assert 'href="./foo.md"' in html
