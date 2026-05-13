@@ -1,0 +1,12 @@
+# Git mailmap — corrects historical author attribution for display.
+#
+# Format: <correct-name> <correct-email> <commit-name> <commit-email>
+# Honored by `git log`, `git shortlog`, `git blame`, and GitHub's UI.
+# See: https://git-scm.com/docs/gitmailmap
+#
+# 2026-05-13: A misconfigured global `user.name=Test / user.email=test@test.com`
+# was used to author commits before being corrected. Map those back to the
+# real author for display. Underlying commit objects are unchanged.
+
+Carlos D. Escobar-Valbuena <carlosdavidescobar@gmail.com> Test <test@test.com>
+Carlos D. Escobar-Valbuena <carlosdavidescobar@gmail.com> Carlos Escobar <carlosdavidescobar@gmail.com>
