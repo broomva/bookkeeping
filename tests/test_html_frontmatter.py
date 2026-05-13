@@ -1,6 +1,8 @@
 """Tests for HTML frontmatter parsing (Category B/C support)."""
+from pathlib import Path
+
 import pytest
-from bookkeeping import parse_html_frontmatter
+from bookkeeping import parse_html_frontmatter, read_frontmatter
 
 
 class TestParseHTMLFrontmatter:
@@ -63,3 +65,36 @@ related_entities:
 """
         fm, _ = parse_html_frontmatter(html)
         assert fm["related_entities"] == ["concept/foo", "pattern/bar"]
+
+
+class TestReadFrontmatterDispatch:
+    def test_md_file(self, tmp_path):
+        f = tmp_path / "note.md"
+        f.write_text("---\ntype: entity\nslug: foo\n---\n# Body\n")
+        fm, body = read_frontmatter(f)
+        assert fm == {"type": "entity", "slug": "foo"}
+        assert body.strip() == "# Body"
+
+    def test_html_file(self, tmp_path):
+        f = tmp_path / "note.html"
+        f.write_text("""<!DOCTYPE html>
+<!--
+---
+type: synthesis
+slug: html-vs-md
+---
+-->
+<html></html>
+""")
+        fm, _ = read_frontmatter(f)
+        assert fm == {"type": "synthesis", "slug": "html-vs-md"}
+
+    def test_unsupported_extension_raises(self, tmp_path):
+        f = tmp_path / "note.txt"
+        f.write_text("nothing")
+        with pytest.raises(ValueError, match="Unsupported"):
+            read_frontmatter(f)
+
+    def test_missing_file_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            read_frontmatter(tmp_path / "ghost.md")

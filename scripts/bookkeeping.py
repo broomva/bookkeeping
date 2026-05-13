@@ -252,6 +252,27 @@ def parse_html_frontmatter(text: str) -> tuple[dict, str]:
     return fm, body
 
 
+def read_frontmatter(path: Path) -> tuple[dict, str]:
+    """
+    Read frontmatter from a file, dispatching by extension.
+
+    .md / .markdown → parse_frontmatter
+    .html           → parse_html_frontmatter
+    other           → ValueError
+
+    Raises FileNotFoundError if the path does not exist.
+    """
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    suffix = path.suffix.lower()
+    text = path.read_text(errors="replace")
+    if suffix in (".md", ".markdown"):
+        return parse_frontmatter(text)
+    if suffix == ".html":
+        return parse_html_frontmatter(text)
+    raise ValueError(f"Unsupported extension for frontmatter: {path.suffix}")
+
+
 def extract_wikilinks_md(text: str) -> list[tuple[str, str]]:
     """
     Extract wikilinks from Markdown text.
