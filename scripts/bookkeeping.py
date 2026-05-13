@@ -29,6 +29,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+# Ensure scripts/ is importable when bookkeeping.py is run as a script
+# (so `from render import …` resolves to scripts/render.py).
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from render import render_markdown_to_html  # noqa: E402
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 BROOMVA_ROOT = Path.home() / "broomva"
@@ -223,6 +231,100 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
         fm = {}
     body = text[m.end():]
     return fm, body
+
+
+def parse_html_frontmatter(text: str) -> tuple[dict, str]:
+    """
+    Parse YAML frontmatter from an HTML file's leading comment.
+
+    Expects a comment of shape `<!--\\n---\\n…\\n---\\n-->` somewhere in
+    the first 4 KB of the document. Returns (frontmatter_dict, body_text);
+    body_text is the original text with the matched frontmatter comment
+    removed. Returns ({}, original_text) if frontmatter is absent,
+    malformed, or not a dict, or if yaml is unavailable.
+    """
+    if not _YAML_AVAILABLE or not text:
+        return {}, text
+
+    head = text[:4096]
+    m = re.search(r"<!--\s*\n---\s*\n(.*?)\n---\s*\n-->", head, re.DOTALL)
+    if not m:
+        return {}, text
+    try:
+        fm = yaml.safe_load(m.group(1))
+    except Exception:
+        return {}, text
+    if not isinstance(fm, dict):
+        return {}, text
+    body = text[: m.start()] + text[m.end():]
+    return fm, body
+
+
+def read_frontmatter(path: Path) -> tuple[dict, str]:
+    """
+    Read frontmatter from a file, dispatching by extension.
+
+    .md / .markdown → parse_frontmatter
+    .html           → parse_html_frontmatter
+    other           → ValueError
+
+    Raises FileNotFoundError if the path does not exist.
+    """
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    suffix = path.suffix.lower()
+    text = path.read_text(errors="replace")
+    if suffix in (".md", ".markdown"):
+        return parse_frontmatter(text)
+    if suffix == ".html":
+        return parse_html_frontmatter(text)
+    raise ValueError(f"Unsupported extension for frontmatter: {path.suffix}")
+
+
+def extract_wikilinks_md(text: str) -> list[tuple[str, str]]:
+    """
+    Extract wikilinks from Markdown text.
+
+    Returns list of (target_slug, edge_type) tuples. For Markdown,
+    edge_type is always "references" (no edge typing in MD wikilink syntax).
+
+    HTML comment blocks are stripped before extraction to avoid false
+    positives from commented-out examples.
+    """
+    body_no_comments = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    return [
+        (link.split("|")[0], "references")
+        for link in re.findall(r"\[\[([^\]]+)\]\]", body_no_comments)
+    ]
+
+
+def extract_wikilinks_html(text: str) -> list[tuple[str, str]]:
+    """
+    Extract typed wikilinks from HTML text.
+
+    Matches `<a … href="…" … data-relation="…">` anchors (attribute order
+    is irrelevant) and returns (target_slug, edge_type) tuples — same
+    shape as extract_wikilinks_md.
+
+    External hrefs (http://, https://, mailto:, #fragment) and untyped
+    anchors (missing data-relation) are skipped. Slug derivation strips
+    leading ./ or ../ segments and the .md/.html extension, so
+    `../concept/foo.md` becomes `concept/foo`.
+    """
+    results: list[tuple[str, str]] = []
+    for tag in re.findall(r"<a\b([^>]*?)>", text, flags=re.IGNORECASE):
+        href_m = re.search(r"""\bhref\s*=\s*(["'])([^"']*)\1""", tag, flags=re.IGNORECASE)
+        rel_m = re.search(r"""\bdata-relation\s*=\s*(["'])([^"']*)\1""", tag, flags=re.IGNORECASE)
+        if not href_m or not rel_m:
+            continue
+        href = href_m.group(2)
+        if re.match(r"^(?:https?:|mailto:|#)", href, flags=re.IGNORECASE):
+            continue
+        # Strip leading ./ or ../ segments, then the .md/.html extension.
+        slug = re.sub(r"^(?:\.{1,2}/)+", "", href)
+        slug = re.sub(r"\.(?:md|html)$", "", slug, flags=re.IGNORECASE)
+        results.append((slug, rel_m.group(2)))
+    return results
 
 
 def ingest_file(source_path: Path, verbose: bool = False) -> list[RawItem]:
@@ -1276,35 +1378,132 @@ def lint_entity_page(entity_path: Path) -> list[LintError]:
                 ))
 
     # Resolve wikilinks in body — skip HTML comment lines to avoid false positives
-    body_no_comments = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
-    wikilinks = re.findall(r"\[\[([^\]]+)\]\]", body_no_comments)
+    wikilinks = extract_wikilinks_md(body)
     existing = set(existing_entity_slugs())
-    for link in wikilinks:
-        slug = slugify(link.split("|")[0])
+    for target, _edge in wikilinks:
+        slug = slugify(target)
         if slug and slug not in existing:
             errors.append(LintError(
                 path_str, "wikilink",
-                f"Broken wikilink: [[{link}]] (slug {slug!r} not found)", "warning"
+                f"Broken wikilink: [[{target}]] (slug {slug!r} not found)", "warning"
             ))
 
     return errors
 
 
 def lint_all(verbose: bool = False) -> list[LintError]:
-    """Run lint_entity_page on all entity pages and aggregate errors."""
+    """Run lint_entity_page on all entity pages and lint_format_discernment on research/."""
     all_errors: list[LintError] = []
-    if not ENTITIES_DIR.exists():
-        return all_errors
-    pages = list(ENTITIES_DIR.rglob("*.md"))
-    if verbose:
-        print(f"[lint] Checking {len(pages)} entity pages...")
-    for page in pages:
-        errs = lint_entity_page(page)
-        all_errors.extend(errs)
-        if verbose and errs:
-            for e in errs:
+    if ENTITIES_DIR.exists():
+        pages = list(ENTITIES_DIR.rglob("*.md"))
+        if verbose:
+            print(f"[lint] Checking {len(pages)} entity pages...")
+        for page in pages:
+            errs = lint_entity_page(page)
+            all_errors.extend(errs)
+            if verbose and errs:
+                for e in errs:
+                    print(f"  [{e.severity.upper()}] {Path(e.file_path).name}: {e.field} — {e.message}")
+    # Format-discernment checks run on research/ tree (parent of entities/)
+    research_dir = ENTITIES_DIR.parent if ENTITIES_DIR.exists() else Path("research")
+    if research_dir.exists():
+        fd_errors = lint_format_discernment(research_dir)
+        all_errors.extend(fd_errors)
+        if verbose and fd_errors:
+            for e in fd_errors:
                 print(f"  [{e.severity.upper()}] {Path(e.file_path).name}: {e.field} — {e.message}")
     return all_errors
+
+
+def lint_format_discernment(root: Path) -> list[LintError]:
+    """
+    Format-discernment lint checks (P17, see SKILL.md "Format Discernment").
+
+    Implements all four belt-and-suspenders checks:
+      - stale_projection: <note>.md mtime > <note>.html mtime → warn
+      - broken_canonical: HTML projection's canonical: points to a missing
+        file OR outside the sibling directory → error
+      - substrate_violation: non-MD file under entities/ → error (Category A
+        is MD-only)
+      - unregistered_c: HTML under notes/ with no frontmatter AND no sibling
+        MD → warn (can't be located in the knowledge graph)
+    """
+    errors: list[LintError] = []
+    if not root.exists():
+        return errors
+    for html_path in root.rglob("*.html"):
+        # 1. stale_projection
+        md_path = html_path.with_suffix(".md")
+        if md_path.exists() and md_path.stat().st_mtime > html_path.stat().st_mtime:
+            errors.append(LintError(
+                str(html_path),
+                "stale_projection",
+                f"{md_path.name} is newer than {html_path.name} — "
+                f"rerun `bookkeeping render` to refresh",
+                "warning",
+            ))
+        # 2. broken_canonical
+        try:
+            fm, _ = parse_html_frontmatter(html_path.read_text(errors="replace"))
+        except Exception:
+            fm = {}
+        canonical = fm.get("canonical")
+        if canonical:
+            # Resolve canonical relative to the HTML file's directory
+            target = (html_path.parent / canonical).resolve()
+            if not target.exists():
+                errors.append(LintError(
+                    str(html_path),
+                    "broken_canonical",
+                    f"canonical: {canonical!r} does not exist relative to {html_path.parent}",
+                    "error",
+                ))
+            elif target.parent != html_path.parent.resolve():
+                errors.append(LintError(
+                    str(html_path),
+                    "broken_canonical",
+                    f"canonical: {canonical!r} resolves outside sibling directory "
+                    f"({target.parent} != {html_path.parent.resolve()})",
+                    "error",
+                ))
+    # 3. substrate_violation: Category A = MD only under entities/
+    # Skip hidden infrastructure dirs (e.g. .lago-blobs/) and hidden files —
+    # those are storage substrate, not entity substrate.
+    entities_dir = root / "entities"
+    if entities_dir.exists():
+        for path in entities_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix in (".md", ".markdown"):
+                continue
+            rel = path.relative_to(entities_dir)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            errors.append(LintError(
+                str(path),
+                "substrate_violation",
+                f"Non-MD file under entities/ — Category A is MD-only "
+                f"(P17 Format Discernment Discipline)",
+                "error",
+            ))
+    # 4. unregistered_c: .html under notes/ with no frontmatter AND no sibling .md
+    notes_dir = root / "notes"
+    if notes_dir.exists():
+        for html_path in notes_dir.rglob("*.html"):
+            try:
+                fm, _ = parse_html_frontmatter(html_path.read_text(errors="replace"))
+            except Exception:
+                fm = {}
+            md_sibling = html_path.with_suffix(".md")
+            if not fm and not md_sibling.exists():
+                errors.append(LintError(
+                    str(html_path),
+                    "unregistered_c",
+                    f"HTML artifact under notes/ has no frontmatter AND no sibling MD — "
+                    f"declare frontmatter (Category C) or add MD source (Category B)",
+                    "warning",
+                ))
+    return errors
 
 
 # ── Full Pipeline ─────────────────────────────────────────────────────────────
@@ -1849,6 +2048,59 @@ def cmd_query(args: argparse.Namespace) -> None:
     run_query(args.slug, verbose=getattr(args, "verbose", False))
 
 
+def cmd_render(args: argparse.Namespace) -> None:
+    """
+    Category B projection: render a Layer 4 synthesis MD into a single-file HTML.
+
+    Path resolution:
+      - file `.md`  → render to sibling `.html`
+      - directory   → render all `*-synthesis.md` inside (non-recursive by default)
+      - --layer N   → render all Layer-N synthesis notes under research/notes/
+    """
+    targets: list[Path] = []
+    src = Path(args.path) if args.path else None
+
+    if args.layer is not None:
+        from_notes = Path("research/notes")
+        if not from_notes.exists():
+            print(f"[render] research/notes/ not found in {Path.cwd()}", file=sys.stderr)
+            sys.exit(2)
+        if args.layer == 4:
+            targets = sorted(from_notes.glob("*-synthesis.md"))
+        else:
+            print(f"[render] --layer {args.layer}: only layer 4 supported today",
+                  file=sys.stderr)
+            sys.exit(2)
+    elif src is None:
+        print("[render] usage: bookkeeping render <path> | --layer N", file=sys.stderr)
+        sys.exit(2)
+    elif src.is_dir():
+        targets = sorted(src.glob("*-synthesis.md"))
+    elif src.is_file():
+        targets = [src]
+    else:
+        print(f"[render] not found: {src}", file=sys.stderr)
+        sys.exit(2)
+
+    if not targets:
+        print("[render] no synthesis notes matched")
+        return
+
+    rendered = 0
+    for md_path in targets:
+        try:
+            md_text = md_path.read_text(errors="replace")
+            html = render_markdown_to_html(md_text, md_path, link_html=args.link_html)
+            out_path = md_path.with_suffix(".html")
+            out_path.write_text(html)
+            rendered += 1
+            if args.verbose:
+                print(f"[render] {md_path} → {out_path}")
+        except Exception as exc:
+            print(f"[render] failed {md_path}: {exc}", file=sys.stderr)
+    print(f"[render] {rendered} file(s) rendered")
+
+
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1922,6 +2174,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_query.add_argument("slug", help="Entity slug (fuzzy matched)")
     p_query.add_argument("--verbose", "-v", action="store_true")
     p_query.set_defaults(func=cmd_query)
+
+    # render (Category B projection — MD canonical → single-file HTML)
+    p_render = sub.add_parser(
+        "render",
+        help="Project a Layer 4 synthesis MD to a single-file HTML (Category B)",
+    )
+    p_render.add_argument("path", nargs="?", help="MD file or directory of -synthesis.md notes")
+    p_render.add_argument("--layer", type=int, default=None,
+                          help="Render all notes at the given layer (currently only 4)")
+    p_render.add_argument("--link-html", action="store_true",
+                          help="Rewrite [[slug]] to .html targets instead of .md")
+    p_render.add_argument("--verbose", action="store_true", help="Print each rendered file")
+    p_render.set_defaults(func=cmd_render)
 
     return parser
 

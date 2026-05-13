@@ -15,6 +15,9 @@ python3 scripts/bookkeeping.py run
 
 # 3. Check graph health and pending synthesis candidates
 python3 scripts/bookkeeping.py status
+
+# 4. (Optional) Project a Layer-4 synthesis MD to single-file HTML for human reading
+python3 scripts/bookkeeping.py render <path>     # project MD → single-file HTML (P17)
 ```
 
 ---
@@ -70,6 +73,24 @@ python3 scripts/bookkeeping.py status
 5. **PROMOTE** — Write items scoring ≥5 to `research/entities/{type}/{slug}.md`; hold 3–4 in Layer 2; discard ≤2
 6. **SYNTHESIZE** — Detect entity clusters (3+ entities sharing tags or wikilinks); flag clusters without synthesis notes as pending candidates
 7. **LINT** — Validate all entity pages: `core_claim` ≤140 chars, sources present, `related` uses `[[wikilink]]` format, no broken wikilinks; output lint report
+
+---
+
+### `bookkeeping render` — Category B projection (MD → HTML)
+
+Project a Layer 4 synthesis MD to a single-file HTML for human reading.
+
+```bash
+bookkeeping render <path>             # one file
+bookkeeping render research/notes/    # directory glob (*-synthesis.md)
+bookkeeping render --layer 4          # all Layer 4 synthesis notes
+bookkeeping render --link-html        # rewrite [[slug]] → .html targets
+```
+
+The HTML is gitignored by default (regenerable from MD) and carries
+`canonical:` frontmatter pointing back to its source MD. See
+[SKILL.md "Format Discernment (P17)"](SKILL.md#format-discernment-p17)
+for when to use this vs keep MD-only.
 
 ---
 
