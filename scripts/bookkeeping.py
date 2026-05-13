@@ -1412,15 +1412,14 @@ def lint_format_discernment(root: Path) -> list[LintError]:
     """
     Format-discernment lint checks (P17, see SKILL.md "Format Discernment").
 
-    Currently implements:
+    Implements all four belt-and-suspenders checks:
       - stale_projection: <note>.md mtime > <note>.html mtime → warn
       - broken_canonical: HTML projection's canonical: points to a missing
         file OR outside the sibling directory → error
       - substrate_violation: non-MD file under entities/ → error (Category A
         is MD-only)
-
-    One additional check lands in a subsequent commit:
-      - unregistered_c
+      - unregistered_c: HTML under notes/ with no frontmatter AND no sibling
+        MD → warn (can't be located in the knowledge graph)
     """
     errors: list[LintError] = []
     if not root.exists():
@@ -1471,6 +1470,23 @@ def lint_format_discernment(root: Path) -> list[LintError]:
                     f"Non-MD file under entities/ — Category A is MD-only "
                     f"(P17 Format Discernment Discipline)",
                     "error",
+                ))
+    # 4. unregistered_c: .html under notes/ with no frontmatter AND no sibling .md
+    notes_dir = root / "notes"
+    if notes_dir.exists():
+        for html_path in notes_dir.rglob("*.html"):
+            try:
+                fm, _ = parse_html_frontmatter(html_path.read_text(errors="replace"))
+            except Exception:
+                fm = {}
+            md_sibling = html_path.with_suffix(".md")
+            if not fm and not md_sibling.exists():
+                errors.append(LintError(
+                    str(html_path),
+                    "unregistered_c",
+                    f"HTML artifact under notes/ has no frontmatter AND no sibling MD — "
+                    f"declare frontmatter (Category C) or add MD source (Category B)",
+                    "warning",
                 ))
     return errors
 
