@@ -1392,18 +1392,25 @@ def lint_entity_page(entity_path: Path) -> list[LintError]:
 
 
 def lint_all(verbose: bool = False) -> list[LintError]:
-    """Run lint_entity_page on all entity pages and aggregate errors."""
+    """Run lint_entity_page on all entity pages and lint_format_discernment on research/."""
     all_errors: list[LintError] = []
-    if not ENTITIES_DIR.exists():
-        return all_errors
-    pages = list(ENTITIES_DIR.rglob("*.md"))
-    if verbose:
-        print(f"[lint] Checking {len(pages)} entity pages...")
-    for page in pages:
-        errs = lint_entity_page(page)
-        all_errors.extend(errs)
-        if verbose and errs:
-            for e in errs:
+    if ENTITIES_DIR.exists():
+        pages = list(ENTITIES_DIR.rglob("*.md"))
+        if verbose:
+            print(f"[lint] Checking {len(pages)} entity pages...")
+        for page in pages:
+            errs = lint_entity_page(page)
+            all_errors.extend(errs)
+            if verbose and errs:
+                for e in errs:
+                    print(f"  [{e.severity.upper()}] {Path(e.file_path).name}: {e.field} — {e.message}")
+    # Format-discernment checks run on research/ tree (parent of entities/)
+    research_dir = ENTITIES_DIR.parent if ENTITIES_DIR.exists() else Path("research")
+    if research_dir.exists():
+        fd_errors = lint_format_discernment(research_dir)
+        all_errors.extend(fd_errors)
+        if verbose and fd_errors:
+            for e in fd_errors:
                 print(f"  [{e.severity.upper()}] {Path(e.file_path).name}: {e.field} — {e.message}")
     return all_errors
 
@@ -1460,17 +1467,25 @@ def lint_format_discernment(root: Path) -> list[LintError]:
                     "error",
                 ))
     # 3. substrate_violation: Category A = MD only under entities/
+    # Skip hidden infrastructure dirs (e.g. .lago-blobs/) and hidden files —
+    # those are storage substrate, not entity substrate.
     entities_dir = root / "entities"
     if entities_dir.exists():
         for path in entities_dir.rglob("*"):
-            if path.is_file() and path.suffix not in (".md", ".markdown"):
-                errors.append(LintError(
-                    str(path),
-                    "substrate_violation",
-                    f"Non-MD file under entities/ — Category A is MD-only "
-                    f"(P17 Format Discernment Discipline)",
-                    "error",
-                ))
+            if not path.is_file():
+                continue
+            if path.suffix in (".md", ".markdown"):
+                continue
+            rel = path.relative_to(entities_dir)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            errors.append(LintError(
+                str(path),
+                "substrate_violation",
+                f"Non-MD file under entities/ — Category A is MD-only "
+                f"(P17 Format Discernment Discipline)",
+                "error",
+            ))
     # 4. unregistered_c: .html under notes/ with no frontmatter AND no sibling .md
     notes_dir = root / "notes"
     if notes_dir.exists():
