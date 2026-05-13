@@ -1,6 +1,6 @@
 """Tests for wikilink extraction (MD and HTML)."""
 import pytest
-from bookkeeping import extract_wikilinks_md
+from bookkeeping import extract_wikilinks_md, extract_wikilinks_html
 
 
 class TestExtractWikilinksMD:
@@ -28,3 +28,34 @@ class TestExtractWikilinksMD:
 
     def test_no_wikilinks(self):
         assert extract_wikilinks_md("Just plain prose.") == []
+
+
+class TestExtractWikilinksHTML:
+    def test_single_typed_link(self):
+        html = '<p>See <a href="../concept/foo.md" data-relation="references">foo</a></p>'
+        assert extract_wikilinks_html(html) == [("concept/foo", "references")]
+
+    def test_multiple_typed_links_different_edges(self):
+        html = '''
+        <a href="../concept/foo.md" data-relation="extends">foo</a>
+        <a href="../pattern/bar.md" data-relation="contradicts">bar</a>
+        '''
+        assert extract_wikilinks_html(html) == [
+            ("concept/foo", "extends"),
+            ("pattern/bar", "contradicts"),
+        ]
+
+    def test_html_target_paths(self):
+        html = '<a href="../concept/foo.html" data-relation="references">foo</a>'
+        assert extract_wikilinks_html(html) == [("concept/foo", "references")]
+
+    def test_skip_untyped_anchors(self):
+        html = '<a href="https://example.com">external</a><a href="../concept/foo.md" data-relation="references">foo</a>'
+        assert extract_wikilinks_html(html) == [("concept/foo", "references")]
+
+    def test_absolute_href_ignored(self):
+        html = '<a href="https://example.com" data-relation="references">link</a>'
+        assert extract_wikilinks_html(html) == []
+
+    def test_empty_text(self):
+        assert extract_wikilinks_html("") == []

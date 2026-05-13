@@ -269,6 +269,35 @@ def extract_wikilinks_md(text: str) -> list[tuple[str, str]]:
     ]
 
 
+def extract_wikilinks_html(text: str) -> list[tuple[str, str]]:
+    """
+    Extract typed wikilinks from HTML text.
+
+    Matches `<a … href="…" … data-relation="…">` anchors (attribute order
+    is irrelevant) and returns (target_slug, edge_type) tuples — same
+    shape as extract_wikilinks_md.
+
+    External hrefs (http://, https://, mailto:, #fragment) and untyped
+    anchors (missing data-relation) are skipped. Slug derivation strips
+    leading ./ or ../ segments and the .md/.html extension, so
+    `../concept/foo.md` becomes `concept/foo`.
+    """
+    results: list[tuple[str, str]] = []
+    for tag in re.findall(r"<a\b([^>]*?)>", text, flags=re.IGNORECASE):
+        href_m = re.search(r'\bhref\s*=\s*"([^"]*)"', tag, flags=re.IGNORECASE)
+        rel_m = re.search(r'\bdata-relation\s*=\s*"([^"]*)"', tag, flags=re.IGNORECASE)
+        if not href_m or not rel_m:
+            continue
+        href = href_m.group(1)
+        if re.match(r"^(?:https?:|mailto:|#)", href, flags=re.IGNORECASE):
+            continue
+        # Strip leading ./ or ../ segments, then the .md/.html extension.
+        slug = re.sub(r"^(?:\.{1,2}/)+", "", href)
+        slug = re.sub(r"\.(?:md|html)$", "", slug, flags=re.IGNORECASE)
+        results.append((slug, rel_m.group(1)))
+    return results
+
+
 def ingest_file(source_path: Path, verbose: bool = False) -> list[RawItem]:
     """
     Normalize a raw extract file to a list of RawItem objects.
