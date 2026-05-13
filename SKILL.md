@@ -204,6 +204,95 @@ Without `--commit`, replay is **read-only** — pure diagnostic. With `--commit`
 
 Smoke-tested against the live workspace: 3 raw extracts gathered, 178 entities frozen in tmpdir, 96 items scored (15 below threshold, 81 would-promote, mean 5.4/9). No writes without `--commit`.
 
+### `render` — Category B projection (MD → single-file HTML)
+
+```bash
+bookkeeping render <path>             # render a single .md file
+bookkeeping render <dir>/             # glob *-synthesis.md in directory
+bookkeeping render --layer 4          # all Layer-4 synthesis notes
+bookkeeping render --link-html        # rewrite [[slug]] → .html targets
+bookkeeping render --verbose          # log each rendered file
+```
+
+Produces a deterministic single-file HTML projection alongside the source MD.
+The HTML carries `canonical:` frontmatter pointing back to the source MD; it
+is gitignored by default and regenerable. See the **Format Discernment (P17)**
+section below for when to use this vs keep MD-only.
+
+---
+
+## Format Discernment (P17)
+
+Before emitting any artifact, classify into one of three categories. Choose
+format from the category, not the other way around.
+
+### Category A — Substrate (MD, always)
+
+Any artifact another agent, governance system, or `bookkeeping` will re-read,
+lint, score, or grep:
+
+- `research/entities/**/*.md` — graph nodes
+- `research/notes/*-raw.md` — Layer 2 extracts
+- `research/notes/*-synthesis.md` — Layer 4 canonical (HTML is a *projection*, see B)
+- `CLAUDE.md`, `AGENTS.md`, `METALAYER.md` — governance, L3
+- `skills/*/SKILL.md` — skill packages, agent-consumed
+- `docs/superpowers/specs/*.md`, `plans/*.md` — superpowers consumed
+- `docs/conversations/*.md` — conversation bridge output
+- `.control/policy.yaml`, `schemas/*.json` — already non-MD, same category
+
+**Invariant:** HTML breaks substrate. MD-only. Frontmatter at top.
+
+### Category B — Projection (MD canonical + HTML on demand)
+
+Artifacts authored and re-edited as text but consumed by a human as a rendered
+document:
+
+- Layer 4 synthesis notes (blog-post candidates)
+- Weekly retros, status updates, post-mortems
+- Architecture explainers (large reviews)
+
+**Behavior:** MD is source-of-truth (lintable, scored, agent-readable).
+`bookkeeping render <path>` projects to HTML for human-read events. HTML is
+`.gitignored`, regenerable, carries `canonical:` frontmatter pointing back
+to MD.
+
+### Category C — Native (format follows medium)
+
+Artifacts where the medium *is* the value — no useful MD source exists:
+
+- Interactive Claude Artifacts (drag-drop boards, animation sandboxes)
+- One-shot HTML explainers a human reads once and discards
+- Future: `.ipynb` analyses, `.tldr` canvases, `.svg` packs
+
+**Behavior:** Format chosen by the agent based on the artifact's intrinsic
+medium. If the artifact joins the knowledge graph, it MUST carry frontmatter
+in its format's idiomatic carrier (HTML-comment YAML for `.html`, notebook
+metadata for `.ipynb`, sidecar `.meta.yaml` for binaries).
+
+### Predicate Test
+
+The agent applies these in order at artifact-creation time:
+
+1. Will any agent or substrate re-read this as text? → **A**
+2. Does an MD source-of-truth exist (or should exist)? → **B**
+3. Is the artifact intrinsically interactive, visual, or one-shot? → **C**
+
+**Tiebreaker:** when ambiguous between B and C, default to **B** (reversible,
+lower disruption).
+
+### Enforcement
+
+Four lint checks via `bookkeeping lint --all`:
+
+| Check | Severity | Trigger |
+|-------|----------|---------|
+| `stale_projection` | warning | `<note>.md` mtime > `<note>.html` mtime |
+| `broken_canonical` | error | `<note>.html`'s `canonical:` field doesn't resolve to existing sibling MD |
+| `substrate_violation` | error | Non-`.md` file under `research/entities/` (hidden dirs like `.lago-blobs/` excluded) |
+| `unregistered_c` | warning | `.html` under `research/notes/` with no frontmatter AND no sibling MD |
+
+Full reference and worked examples: `references/format-discernment.md`.
+
 ---
 
 ## 4-Layer Knowledge Lifecycle
