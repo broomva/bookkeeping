@@ -225,6 +225,33 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     return fm, body
 
 
+def parse_html_frontmatter(text: str) -> tuple[dict, str]:
+    """
+    Parse YAML frontmatter from an HTML file's leading comment.
+
+    Expects a comment of shape `<!--\\n---\\n…\\n---\\n-->` somewhere in
+    the first 4 KB of the document. Returns (frontmatter_dict, body_text);
+    body_text is the original text with the matched frontmatter comment
+    removed. Returns ({}, original_text) if frontmatter is absent,
+    malformed, or not a dict, or if yaml is unavailable.
+    """
+    if not _YAML_AVAILABLE or not text:
+        return {}, text
+
+    head = text[:4096]
+    m = re.search(r"<!--\s*\n---\s*\n(.*?)\n---\s*\n-->", head, re.DOTALL)
+    if not m:
+        return {}, text
+    try:
+        fm = yaml.safe_load(m.group(1))
+    except Exception:
+        return {}, text
+    if not isinstance(fm, dict):
+        return {}, text
+    body = text[: m.start()] + text[m.end():]
+    return fm, body
+
+
 def extract_wikilinks_md(text: str) -> list[tuple[str, str]]:
     """
     Extract wikilinks from Markdown text.
