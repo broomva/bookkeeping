@@ -1416,9 +1416,11 @@ def lint_format_discernment(root: Path) -> list[LintError]:
       - stale_projection: <note>.md mtime > <note>.html mtime → warn
       - broken_canonical: HTML projection's canonical: points to a missing
         file OR outside the sibling directory → error
+      - substrate_violation: non-MD file under entities/ → error (Category A
+        is MD-only)
 
-    Two additional checks land in subsequent commits:
-      - substrate_violation, unregistered_c
+    One additional check lands in a subsequent commit:
+      - unregistered_c
     """
     errors: list[LintError] = []
     if not root.exists():
@@ -1456,6 +1458,18 @@ def lint_format_discernment(root: Path) -> list[LintError]:
                     "broken_canonical",
                     f"canonical: {canonical!r} resolves outside sibling directory "
                     f"({target.parent} != {html_path.parent.resolve()})",
+                    "error",
+                ))
+    # 3. substrate_violation: Category A = MD only under entities/
+    entities_dir = root / "entities"
+    if entities_dir.exists():
+        for path in entities_dir.rglob("*"):
+            if path.is_file() and path.suffix not in (".md", ".markdown"):
+                errors.append(LintError(
+                    str(path),
+                    "substrate_violation",
+                    f"Non-MD file under entities/ — Category A is MD-only "
+                    f"(P17 Format Discernment Discipline)",
                     "error",
                 ))
     return errors

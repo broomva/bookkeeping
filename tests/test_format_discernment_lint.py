@@ -64,3 +64,33 @@ class TestBrokenCanonical:
         errors = lint_format_discernment(tmp_path)
         broken = [e for e in errors if e.field == "broken_canonical"]
         assert len(broken) == 1
+
+
+class TestSubstrateViolation:
+    def test_clean(self, tmp_path):
+        entities = tmp_path / "entities"
+        entities.mkdir()
+        (entities / "concept").mkdir()
+        (entities / "concept" / "foo.md").write_text("---\nslug: foo\n---\nBody")
+        errors = lint_format_discernment(tmp_path)
+        assert [e for e in errors if e.field == "substrate_violation"] == []
+
+    def test_html_under_entities_errors(self, tmp_path):
+        entities = tmp_path / "entities"
+        entities.mkdir()
+        (entities / "concept").mkdir()
+        (entities / "concept" / "foo.html").write_text("<!DOCTYPE html><html></html>")
+        errors = lint_format_discernment(tmp_path)
+        sub = [e for e in errors if e.field == "substrate_violation"]
+        assert len(sub) == 1
+        assert sub[0].severity == "error"
+        assert "Category A is MD-only" in sub[0].message
+
+    def test_other_non_md_under_entities_errors(self, tmp_path):
+        entities = tmp_path / "entities"
+        entities.mkdir()
+        (entities / "concept").mkdir()
+        (entities / "concept" / "data.json").write_text("{}")
+        errors = lint_format_discernment(tmp_path)
+        sub = [e for e in errors if e.field == "substrate_violation"]
+        assert len(sub) == 1
