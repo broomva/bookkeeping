@@ -1408,6 +1408,32 @@ def lint_all(verbose: bool = False) -> list[LintError]:
     return all_errors
 
 
+def lint_format_discernment(root: Path) -> list[LintError]:
+    """
+    Format-discernment lint checks (P17, see SKILL.md "Format Discernment").
+
+    Currently implements:
+      - stale_projection: <note>.md mtime > <note>.html mtime → warn
+
+    Three additional checks land in subsequent commits:
+      - broken_canonical, substrate_violation, unregistered_c
+    """
+    errors: list[LintError] = []
+    if not root.exists():
+        return errors
+    for html_path in root.rglob("*.html"):
+        md_path = html_path.with_suffix(".md")
+        if md_path.exists() and md_path.stat().st_mtime > html_path.stat().st_mtime:
+            errors.append(LintError(
+                str(html_path),
+                "stale_projection",
+                f"{md_path.name} is newer than {html_path.name} — "
+                f"rerun `bookkeeping render` to refresh",
+                "warning",
+            ))
+    return errors
+
+
 # ── Full Pipeline ─────────────────────────────────────────────────────────────
 
 def run_pipeline(
