@@ -59,3 +59,13 @@ class TestExtractWikilinksHTML:
 
     def test_empty_text(self):
         assert extract_wikilinks_html("") == []
+
+    def test_single_quoted_attrs(self):
+        """Renderer-agnostic: accept both " and ' as attribute delimiters."""
+        html = "<a href='../concept/foo.md' data-relation='references'>foo</a>"
+        assert extract_wikilinks_html(html) == [("concept/foo", "references")]
+
+    def test_mixed_quote_styles(self):
+        """One attr double-quoted, the other single-quoted — both work."""
+        html = '<a href="../concept/foo.md" data-relation=\'references\'>foo</a>'
+        assert extract_wikilinks_html(html) == [("concept/foo", "references")]
