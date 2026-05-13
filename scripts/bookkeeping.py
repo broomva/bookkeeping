@@ -29,6 +29,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+# Ensure scripts/ is importable when bookkeeping.py is run as a script
+# (so `from render import …` resolves to scripts/render.py).
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from render import render_markdown_to_html  # noqa: E402
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 BROOMVA_ROOT = Path.home() / "broomva"
@@ -1942,6 +1950,59 @@ def cmd_query(args: argparse.Namespace) -> None:
     run_query(args.slug, verbose=getattr(args, "verbose", False))
 
 
+def cmd_render(args: argparse.Namespace) -> None:
+    """
+    Category B projection: render a Layer 4 synthesis MD into a single-file HTML.
+
+    Path resolution:
+      - file `.md`  → render to sibling `.html`
+      - directory   → render all `*-synthesis.md` inside (non-recursive by default)
+      - --layer N   → render all Layer-N synthesis notes under research/notes/
+    """
+    targets: list[Path] = []
+    src = Path(args.path) if args.path else None
+
+    if args.layer is not None:
+        from_notes = Path("research/notes")
+        if not from_notes.exists():
+            print(f"[render] research/notes/ not found in {Path.cwd()}", file=sys.stderr)
+            sys.exit(2)
+        if args.layer == 4:
+            targets = sorted(from_notes.glob("*-synthesis.md"))
+        else:
+            print(f"[render] --layer {args.layer}: only layer 4 supported today",
+                  file=sys.stderr)
+            sys.exit(2)
+    elif src is None:
+        print("[render] usage: bookkeeping render <path> | --layer N", file=sys.stderr)
+        sys.exit(2)
+    elif src.is_dir():
+        targets = sorted(src.glob("*-synthesis.md"))
+    elif src.is_file():
+        targets = [src]
+    else:
+        print(f"[render] not found: {src}", file=sys.stderr)
+        sys.exit(2)
+
+    if not targets:
+        print("[render] no synthesis notes matched")
+        return
+
+    rendered = 0
+    for md_path in targets:
+        try:
+            md_text = md_path.read_text(errors="replace")
+            html = render_markdown_to_html(md_text, md_path, link_html=args.link_html)
+            out_path = md_path.with_suffix(".html")
+            out_path.write_text(html)
+            rendered += 1
+            if args.verbose:
+                print(f"[render] {md_path} → {out_path}")
+        except Exception as exc:
+            print(f"[render] failed {md_path}: {exc}", file=sys.stderr)
+    print(f"[render] {rendered} file(s) rendered")
+
+
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2015,6 +2076,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_query.add_argument("slug", help="Entity slug (fuzzy matched)")
     p_query.add_argument("--verbose", "-v", action="store_true")
     p_query.set_defaults(func=cmd_query)
+
+    # render (Category B projection — MD canonical → single-file HTML)
+    p_render = sub.add_parser(
+        "render",
+        help="Project a Layer 4 synthesis MD to a single-file HTML (Category B)",
+    )
+    p_render.add_argument("path", nargs="?", help="MD file or directory of -synthesis.md notes")
+    p_render.add_argument("--layer", type=int, default=None,
+                          help="Render all notes at the given layer (currently only 4)")
+    p_render.add_argument("--link-html", action="store_true",
+                          help="Rewrite [[slug]] to .html targets instead of .md")
+    p_render.add_argument("--verbose", action="store_true", help="Print each rendered file")
+    p_render.set_defaults(func=cmd_render)
 
     return parser
 
