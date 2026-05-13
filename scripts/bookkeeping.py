@@ -1414,14 +1414,17 @@ def lint_format_discernment(root: Path) -> list[LintError]:
 
     Currently implements:
       - stale_projection: <note>.md mtime > <note>.html mtime → warn
+      - broken_canonical: HTML projection's canonical: points to a missing
+        file OR outside the sibling directory → error
 
-    Three additional checks land in subsequent commits:
-      - broken_canonical, substrate_violation, unregistered_c
+    Two additional checks land in subsequent commits:
+      - substrate_violation, unregistered_c
     """
     errors: list[LintError] = []
     if not root.exists():
         return errors
     for html_path in root.rglob("*.html"):
+        # 1. stale_projection
         md_path = html_path.with_suffix(".md")
         if md_path.exists() and md_path.stat().st_mtime > html_path.stat().st_mtime:
             errors.append(LintError(
@@ -1431,6 +1434,30 @@ def lint_format_discernment(root: Path) -> list[LintError]:
                 f"rerun `bookkeeping render` to refresh",
                 "warning",
             ))
+        # 2. broken_canonical
+        try:
+            fm, _ = parse_html_frontmatter(html_path.read_text(errors="replace"))
+        except Exception:
+            fm = {}
+        canonical = fm.get("canonical")
+        if canonical:
+            # Resolve canonical relative to the HTML file's directory
+            target = (html_path.parent / canonical).resolve()
+            if not target.exists():
+                errors.append(LintError(
+                    str(html_path),
+                    "broken_canonical",
+                    f"canonical: {canonical!r} does not exist relative to {html_path.parent}",
+                    "error",
+                ))
+            elif target.parent != html_path.parent.resolve():
+                errors.append(LintError(
+                    str(html_path),
+                    "broken_canonical",
+                    f"canonical: {canonical!r} resolves outside sibling directory "
+                    f"({target.parent} != {html_path.parent.resolve()})",
+                    "error",
+                ))
     return errors
 
 
