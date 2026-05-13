@@ -2,15 +2,19 @@
 bookkeeping render — Category B projection (MD canonical → single-file HTML).
 
 The HTML output is deterministic: same input markdown produces byte-identical
-HTML. Frontmatter is preserved verbatim as a leading HTML comment, with a
-`canonical:` field injected to point back to the source MD. Wikilinks are
-rewritten to typed <a> tags so the HTML can re-join the knowledge graph.
+HTML. Frontmatter is re-emitted via PyYAML with sort_keys=True for
+determinism (keys are alphabetized; datetime/string values are PyYAML-
+normalized). The shape mirrors MD frontmatter exactly: an HTML-comment
+YAML block at the top of the file. A `canonical:` field is injected/
+overwritten to point back to the source MD. Wikilinks are rewritten to
+typed <a> tags so the HTML can re-join the knowledge graph.
 
 No external dependencies beyond mistune and PyYAML.
 """
 from __future__ import annotations
 
 import re
+from html import escape
 from pathlib import Path
 from string import Template
 
@@ -24,6 +28,14 @@ TEMPLATE_HTML = TEMPLATES_DIR / "render-template.html"
 TEMPLATE_CSS = TEMPLATES_DIR / "render-style.css"
 
 WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
+
+# Matches fenced code blocks (```...```), indented code blocks (4+ spaces at line start),
+# and inline code (`...`). Code spans are preserved verbatim during wikilink rewriting.
+CODE_SPAN_RE = re.compile(
+    r"(?P<fenced>```[^\n]*\n.*?\n```)"        # fenced
+    r"|(?P<inline>`[^`\n]+`)",                  # inline (single-line, no newlines)
+    re.DOTALL,
+)
 
 
 def _load_template() -> Template:
@@ -76,25 +88,49 @@ def _rewrite_wikilinks(md_text: str, source_path: Path, link_html: bool) -> str:
     """
     Rewrite [[slug]] and [[slug|alias]] into typed inline HTML anchors.
 
-    mistune in escape=False mode passes inline HTML through unchanged, so
-    the resulting <a> tags survive markdown rendering with all attributes
-    intact. Targets are .md by default, .html when link_html=True (for
-    full-graph projection runs).
+    Skips fenced (```) and inline (`) code spans so documentation of
+    wikilink syntax renders literally. mistune in escape=False mode
+    passes the inline HTML anchors through unchanged.
+
+    Returns the literal `[[…]]` text unchanged when the target is empty
+    or ends in a trailing slash (malformed); the author sees the broken
+    syntax instead of an invisible/broken anchor.
     """
     suffix = ".html" if link_html else ".md"
 
-    def repl(m: re.Match) -> str:
+    def render_link(m: re.Match) -> str:
         raw = m.group(1).strip()
         target, _, alias = raw.partition("|")
         target = target.strip()
-        alias = alias.strip() or target.rsplit("/", 1)[-1]
+        alias = alias.strip()
+        # Malformed: empty target or trailing slash → leave literal
+        if not target or target.endswith("/"):
+            return m.group(0)
+        if not alias:
+            alias = target.rsplit("/", 1)[-1]
         if "/" in target:
             href = f"../{target}{suffix}"
         else:
             href = f"./{target}{suffix}"
-        return f'<a href="{href}" data-relation="references">{alias}</a>'
+        return f'<a href="{escape(href, quote=True)}" data-relation="references">{escape(alias)}</a>'
 
-    return WIKILINK_RE.sub(repl, md_text)
+    def transform_segment(text: str) -> str:
+        return WIKILINK_RE.sub(render_link, text)
+
+    # Split into code and non-code segments; rewrite only non-code.
+    parts: list[str] = []
+    pos = 0
+    for m in CODE_SPAN_RE.finditer(md_text):
+        # Non-code segment before this code span
+        if m.start() > pos:
+            parts.append(transform_segment(md_text[pos:m.start()]))
+        # Code segment verbatim
+        parts.append(m.group(0))
+        pos = m.end()
+    # Trailing non-code segment
+    if pos < len(md_text):
+        parts.append(transform_segment(md_text[pos:]))
+    return "".join(parts)
 
 
 def _build_renderer() -> mistune.Markdown:
@@ -137,8 +173,8 @@ def render_markdown_to_html(
     css = _load_css()
     return template.safe_substitute(
         frontmatter_block=_build_frontmatter_block(fm, canonical_href),
-        canonical_href=canonical_href,
-        title=str(title),
+        canonical_href=escape(canonical_href, quote=True),
+        title=escape(str(title), quote=True),
         css=css,
         body_html=body_html,
     )
