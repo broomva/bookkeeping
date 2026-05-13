@@ -94,3 +94,34 @@ class TestSubstrateViolation:
         errors = lint_format_discernment(tmp_path)
         sub = [e for e in errors if e.field == "substrate_violation"]
         assert len(sub) == 1
+
+
+class TestUnregisteredCategoryC:
+    def test_clean_projection_pair(self, tmp_path):
+        notes = tmp_path / "notes"
+        notes.mkdir()
+        (notes / "x-synthesis.md").write_text("---\nslug: x\n---\nBody")
+        (notes / "x-synthesis.html").write_text(
+            "<!DOCTYPE html>\n<!--\n---\ncanonical: ./x-synthesis.md\n---\n-->\n<html></html>"
+        )
+        errors = lint_format_discernment(tmp_path)
+        assert [e for e in errors if e.field == "unregistered_c"] == []
+
+    def test_html_without_frontmatter_or_sibling_warns(self, tmp_path):
+        notes = tmp_path / "notes"
+        notes.mkdir()
+        (notes / "rogue.html").write_text("<!DOCTYPE html><html><body>orphan</body></html>")
+        errors = lint_format_discernment(tmp_path)
+        unreg = [e for e in errors if e.field == "unregistered_c"]
+        assert len(unreg) == 1
+        assert unreg[0].severity == "warning"
+
+    def test_html_with_frontmatter_no_sibling_ok(self, tmp_path):
+        notes = tmp_path / "notes"
+        notes.mkdir()
+        (notes / "demo.html").write_text(
+            "<!DOCTYPE html>\n<!--\n---\ntype: artifact\nslug: demo\n---\n-->\n<html></html>"
+        )
+        errors = lint_format_discernment(tmp_path)
+        unreg = [e for e in errors if e.field == "unregistered_c"]
+        assert unreg == []
