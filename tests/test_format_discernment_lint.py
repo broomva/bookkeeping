@@ -29,3 +29,38 @@ class TestStaleProjection:
         assert len(stale) == 1
         assert stale[0].severity == "warning"
         assert "x-synthesis.html" in stale[0].file_path
+
+
+class TestBrokenCanonical:
+    def test_clean(self, tmp_path):
+        md = tmp_path / "x.md"
+        html = tmp_path / "x.html"
+        md.write_text("---\nslug: x\n---\nBody")
+        html.write_text(
+            "<!DOCTYPE html>\n<!--\n---\ncanonical: ./x.md\n---\n-->\n<html></html>"
+        )
+        errors = lint_format_discernment(tmp_path)
+        assert [e for e in errors if e.field == "broken_canonical"] == []
+
+    def test_canonical_points_to_missing_md(self, tmp_path):
+        html = tmp_path / "x.html"
+        html.write_text(
+            "<!DOCTYPE html>\n<!--\n---\ncanonical: ./ghost.md\n---\n-->\n<html></html>"
+        )
+        errors = lint_format_discernment(tmp_path)
+        broken = [e for e in errors if e.field == "broken_canonical"]
+        assert len(broken) == 1
+        assert broken[0].severity == "error"
+
+    def test_canonical_points_to_non_sibling(self, tmp_path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        md = sub / "real.md"
+        md.write_text("---\nslug: real\n---\nBody")
+        html = tmp_path / "x.html"
+        html.write_text(
+            "<!DOCTYPE html>\n<!--\n---\ncanonical: ./real.md\n---\n-->\n<html></html>"
+        )
+        errors = lint_format_discernment(tmp_path)
+        broken = [e for e in errors if e.field == "broken_canonical"]
+        assert len(broken) == 1
