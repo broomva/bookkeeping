@@ -225,6 +225,23 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     return fm, body
 
 
+def extract_wikilinks_md(text: str) -> list[tuple[str, str]]:
+    """
+    Extract wikilinks from Markdown text.
+
+    Returns list of (target_slug, edge_type) tuples. For Markdown,
+    edge_type is always "references" (no edge typing in MD wikilink syntax).
+
+    HTML comment blocks are stripped before extraction to avoid false
+    positives from commented-out examples.
+    """
+    body_no_comments = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    return [
+        (link.split("|")[0], "references")
+        for link in re.findall(r"\[\[([^\]]+)\]\]", body_no_comments)
+    ]
+
+
 def ingest_file(source_path: Path, verbose: bool = False) -> list[RawItem]:
     """
     Normalize a raw extract file to a list of RawItem objects.
@@ -1276,15 +1293,14 @@ def lint_entity_page(entity_path: Path) -> list[LintError]:
                 ))
 
     # Resolve wikilinks in body — skip HTML comment lines to avoid false positives
-    body_no_comments = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
-    wikilinks = re.findall(r"\[\[([^\]]+)\]\]", body_no_comments)
+    wikilinks = extract_wikilinks_md(body)
     existing = set(existing_entity_slugs())
-    for link in wikilinks:
-        slug = slugify(link.split("|")[0])
+    for target, _edge in wikilinks:
+        slug = slugify(target)
         if slug and slug not in existing:
             errors.append(LintError(
                 path_str, "wikilink",
-                f"Broken wikilink: [[{link}]] (slug {slug!r} not found)", "warning"
+                f"Broken wikilink: [[{target}]] (slug {slug!r} not found)", "warning"
             ))
 
     return errors
